@@ -9,7 +9,9 @@
 //! - `PARODIA_VALIDATION=1/0` — проверка ошибок Vulkan (по умолчанию включена в отладочной сборке);
 //! - `PARODIA_LANG=en` — английский интерфейс (по умолчанию русский);
 //! - `PARODIA_SEED=<число>` — зерно мира (по умолчанию 1337);
-//! - `PARODIA_RADIUS=<чанков>` — радиус загрузки мира (по умолчанию 8);
+//! - `PARODIA_RADIUS=<чанков>` — радиус загрузки мира по горизонтали (по умолчанию 8);
+//! - `PARODIA_VRADIUS=<чанков>` — окно загрузки по высоте вокруг камеры (по умолчанию 4);
+//! - `PARODIA_WORKERS=<число>` — рабочих потоков генерации и мешинга (по умолчанию ядра − 2, не больше 6);
 //! - `PARODIA_FACE_CULLING=0` — рисовать и задние грани (для отладки).
 
 use std::collections::HashSet;
@@ -20,6 +22,7 @@ use anyhow::{Context as _, Result};
 use glam::DVec3;
 use parodia_core::env_flags;
 use parodia_core::frame_timer::FpsCounter;
+use parodia_core::jobs::default_worker_count;
 use parodia_render::{FrameStats, Renderer, RendererConfig, SceneView, UiFrame, vk};
 use parodia_ui::{DebugStats, GpuKind, Lang, WorldDebug};
 use parodia_world::{BlockPos, BlockRegistry, ChunkPos, TerrainGenerator};
@@ -32,7 +35,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera::FlyCamera;
 use crate::perf_log::PerfLog;
-use crate::terrain_loader;
+use crate::streaming::{StreamConfig, TerrainStreamer};
 
 /// Направление на солнце (пока неподвижное; смена суток — этап 7).
 const SUN_DIRECTION: [f32; 3] = [0.38, 0.85, 0.36];
@@ -47,6 +50,7 @@ struct WorldView {
     /// Радиус загрузки в блоках (для тумана).
     radius_blocks: f32,
     camera: FlyCamera,
+    streamer: TerrainStreamer,
 }
 
 /// Всё, что существует, пока открыто окно.
@@ -198,6 +202,13 @@ impl App {
         if self.mouse_captured {
             run.world.camera.update(dt, &self.keys);
         }
+        let stream_started = Instant::now();
+        run.world.streamer.update(
+            &mut run.renderer,
+            run.world.camera.position,
+            run.world.camera.forward(),
+        );
+        let stream_ms = stream_started.elapsed().as_secs_f32() * 1000.0;
 
         let (width, height) = run.renderer.extent();
         let aspect = if height > 0 {
@@ -226,6 +237,7 @@ impl App {
             &self.fps,
             &self.last_frame,
             &run.world,
+            stream_ms,
             self.mouse_captured,
         );
         let show_debug = self.show_debug;
@@ -258,7 +270,8 @@ impl App {
     }
 }
 
-/// Создаёт мир: реестр блоков, генератор, загрузка ландшафта вокруг точки появления, камера.
+/// Создаёт мир: реестр блоков, генератор, стример чанков, камера в точке появления.
+/// Сам ландшафт подгружается в фоне, начиная с первого кадра.
 fn load_world(renderer: &mut Renderer) -> Result<WorldView> {
     let registry = BlockRegistry::builtin()?;
     // Цвета из файла — в sRGB; шейдер работает в линейном цвете.
@@ -271,28 +284,35 @@ fn load_world(renderer: &mut Renderer) -> Result<WorldView> {
         .collect();
     renderer.set_block_colors(&colors)?;
 
+    let number = |name: &str, default: i64, min: i64, max: i64| {
+        env_flags::text(name)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(default)
+            .clamp(min, max)
+    };
     let seed = env_flags::text("SEED")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(1337);
-    let radius = env_flags::text("RADIUS")
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(8)
-        .clamp(1, 48);
+    let config = StreamConfig {
+        radius: number("RADIUS", 8, 1, 48),
+        vertical_radius: number("VRADIUS", 4, 1, 32),
+        workers: number("WORKERS", default_worker_count() as i64, 1, 32) as usize,
+    };
     let generator = TerrainGenerator::new(seed, &registry)?;
 
     let spawn_x = 0i64;
     let spawn_z = 0i64;
+    let spawn_height = generator.height_at(spawn_x, spawn_z) as f64 + 30.0;
     let center = BlockPos::new(spawn_x, 0, spawn_z).chunk();
     let render_origin = ChunkPos::new(center.x, 0, center.z).origin();
-    log::info!("world: seed {seed}, load radius {radius} chunks");
-    terrain_loader::load_around(renderer, &registry, &generator, center, radius, render_origin)?;
+    log::info!("world: seed {seed}");
 
-    let spawn_height = generator.height_at(spawn_x, spawn_z) as f64 + 30.0;
     Ok(WorldView {
         seed,
         render_origin,
-        radius_blocks: (radius * 32) as f32,
+        radius_blocks: (config.radius * 32) as f32,
         camera: FlyCamera::new(DVec3::new(spawn_x as f64 + 0.5, spawn_height, spawn_z as f64 + 0.5)),
+        streamer: TerrainStreamer::new(generator, &registry, config, render_origin)?,
     })
 }
 
@@ -388,6 +408,7 @@ fn collect_debug_stats(
     fps: &FpsCounter,
     frame: &FrameStats,
     world: &WorldView,
+    stream_ms: f32,
     mouse_captured: bool,
 ) -> DebugStats {
     let info = renderer.gpu_info();
@@ -400,6 +421,7 @@ fn collect_debug_stats(
         _ => GpuKind::Other,
     };
     let terrain = renderer.terrain_stats();
+    let stream = world.streamer.stats();
     let position = world.camera.position;
     let block = BlockPos::new(
         position.x.floor() as i64,
@@ -411,6 +433,7 @@ fn collect_debug_stats(
         fps: fps.fps(),
         frame_ms: fps.frame_ms(),
         cpu_ms: frame.cpu_ms,
+        wait_ms: frame.wait_ms,
         gpu_ms: frame.gpu_ms,
         gpu_name: info.name.clone(),
         gpu_kind,
@@ -440,6 +463,17 @@ fn collect_debug_stats(
             } else {
                 0.0
             },
+            loaded: stream.loaded,
+            meshed: stream.meshed,
+            generating: stream.generating,
+            meshing: stream.meshing,
+            queued_jobs: stream.queued_jobs,
+            pending_uploads: terrain.pending_uploads as usize,
+            workers: stream.workers,
+            generate_ms: stream.generate_ms,
+            mesh_ms: stream.mesh_ms,
+            stream_ms,
+            upload_kb: frame.upload_bytes as f32 / 1024.0,
         }),
         mouse_captured,
     }

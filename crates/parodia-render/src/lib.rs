@@ -22,4 +22,4 @@ mod timing;
 pub use ash::vk;
 pub use context::GpuInfo;
 pub use renderer::{FrameStats, Renderer, RendererConfig, SceneView, UiFrame};
-pub use terrain::{ChunkMeshId, ChunkUpload, TerrainStats};
+pub use terrain::{ChunkMeshId, ChunkUpload, TerrainStats, UPLOAD_BUDGET_BYTES};

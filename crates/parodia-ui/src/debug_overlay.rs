@@ -23,6 +23,8 @@ pub struct DebugStats {
     pub fps: f32,
     pub frame_ms: f32,
     pub cpu_ms: f32,
+    /// Ожидание видеокарты и монитора за кадр (при VSync почти весь кадр).
+    pub wait_ms: f32,
     pub gpu_ms: Option<f32>,
     pub gpu_name: String,
     pub gpu_kind: GpuKind,
@@ -48,6 +50,25 @@ pub struct WorldDebug {
     pub draws: u32,
     pub quads: u64,
     pub pool_percent: f32,
+    /// Чанков в памяти (сгенерированных).
+    pub loaded: usize,
+    /// Чанков с моделью на экране.
+    pub meshed: usize,
+    /// Задачи в работе: генерация и построение моделей.
+    pub generating: usize,
+    pub meshing: usize,
+    /// Задач в очереди рабочих потоков.
+    pub queued_jobs: usize,
+    /// Моделей, ждущих копирования в видеопамять.
+    pub pending_uploads: usize,
+    pub workers: usize,
+    /// Среднее время одной задачи (мс).
+    pub generate_ms: f32,
+    pub mesh_ms: f32,
+    /// Время работы стримера в главном потоке за кадр (мс).
+    pub stream_ms: f32,
+    /// Скопировано в видеопамять за кадр (КБ).
+    pub upload_kb: f32,
 }
 
 /// Рисует экран F3 в левом верхнем углу.
@@ -68,7 +89,13 @@ pub fn debug_overlay(ctx: &egui::Context, lang: &Lang, stats: &DebugStats) {
                 ("ms", &format!("{:.2}", stats.frame_ms)),
             ],
         ),
-        lang.fmt("debug.cpu_time", &[("ms", &format!("{:.2}", stats.cpu_ms))]),
+        lang.fmt(
+            "debug.cpu_time",
+            &[
+                ("ms", &format!("{:.2}", stats.cpu_ms)),
+                ("wait", &format!("{:.2}", stats.wait_ms)),
+            ],
+        ),
         match stats.gpu_ms {
             Some(ms) => lang.fmt("debug.gpu_time", &[("ms", &format!("{ms:.2}"))]),
             None => lang.tr("debug.gpu_time_none").to_string(),
@@ -109,6 +136,29 @@ pub fn debug_overlay(ctx: &egui::Context, lang: &Lang, stats: &DebugStats) {
         lines.push(lang.fmt(
             "debug.pool",
             &[("percent", &format!("{:.1}", world.pool_percent))],
+        ));
+        lines.push(lang.fmt(
+            "debug.stream",
+            &[("loaded", &world.loaded), ("meshed", &world.meshed)],
+        ));
+        lines.push(lang.fmt(
+            "debug.jobs",
+            &[
+                ("generating", &world.generating),
+                ("meshing", &world.meshing),
+                ("queued", &world.queued_jobs),
+                ("uploads", &world.pending_uploads),
+                ("workers", &world.workers),
+            ],
+        ));
+        lines.push(lang.fmt(
+            "debug.job_time",
+            &[
+                ("generate", &format!("{:.2}", world.generate_ms)),
+                ("mesh", &format!("{:.2}", world.mesh_ms)),
+                ("stream", &format!("{:.2}", world.stream_ms)),
+                ("upload", &format!("{:.0}", world.upload_kb)),
+            ],
         ));
     }
     if !stats.mouse_captured {

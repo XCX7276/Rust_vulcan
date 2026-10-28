@@ -5,7 +5,7 @@
 //! 2. создаётся цикл событий окна (winit);
 //! 3. `App` (файл `app.rs`) создаёт окно, рендер и мир и дальше рисует кадры, пока окно не закроют.
 //!
-//! Остальные файлы: `camera.rs` — летающая камера, `terrain_loader.rs` — загрузка ландшафта,
+//! Остальные файлы: `camera.rs` — летающая камера, `streaming.rs` — подгрузка и выгрузка мира,
 //! `perf_log.rs` — строка замера скорости в журнале.
 //!
 //! В финальной сборке (`--release`) консольное окно скрыто; ошибки смотрите в журнале.
@@ -15,7 +15,7 @@
 mod app;
 mod camera;
 mod perf_log;
-mod terrain_loader;
+mod streaming;
 
 use anyhow::Result;
 use winit::event_loop::{ControlFlow, EventLoop};

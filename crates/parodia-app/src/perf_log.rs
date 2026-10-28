@@ -1,7 +1,8 @@
 //! Строка замера скорости в журнале.
 //!
 //! Раз в 10 секунд пишет в журнал средние значения:
-//! `perf: <FPS> fps, frame <мс> (worst <худший кадр>), cpu <мс>, gpu <мс>, draws <N>, quads <N>, <ширина>x<высота>`.
+//! `perf: <FPS> fps, frame <мс> (worst <худший кадр>), cpu <работа мс>, wait <ожидание мс>, gpu <мс>,
+//! draws <N>, quads <N>, upload <МБ/с>, <ширина>x<высота>`.
 //! Так замеры можно сравнивать по файлу журнала, а не переписывать с экрана.
 
 use std::time::{Duration, Instant};
@@ -14,6 +15,8 @@ pub struct PerfLog {
     started: Instant,
     frames: u32,
     cpu_ms: f64,
+    wait_ms: f64,
+    upload_bytes: u64,
     gpu_ms: f64,
     gpu_frames: u32,
     draws: u64,
@@ -28,6 +31,8 @@ impl PerfLog {
             started: Instant::now(),
             frames: 0,
             cpu_ms: 0.0,
+            wait_ms: 0.0,
+            upload_bytes: 0,
             gpu_ms: 0.0,
             gpu_frames: 0,
             draws: 0,
@@ -46,6 +51,8 @@ impl PerfLog {
         self.last_frame_at = Some(now);
         self.frames += 1;
         self.cpu_ms += frame.cpu_ms as f64;
+        self.wait_ms += frame.wait_ms as f64;
+        self.upload_bytes += frame.upload_bytes;
         self.draws += frame.terrain_draws as u64;
         self.quads += frame.terrain_quads;
         if let Some(gpu) = frame.gpu_ms {
@@ -62,13 +69,15 @@ impl PerfLog {
                 "-".into()
             };
             log::info!(
-                "perf: {:.0} fps, frame {:.2} ms (worst {:.1} ms), cpu {:.2} ms, gpu {gpu} ms, draws {:.0}, quads {:.0}, {width}x{height}",
+                "perf: {:.0} fps, frame {:.2} ms (worst {:.1} ms), cpu {:.2} ms, wait {:.2} ms, gpu {gpu} ms, draws {:.0}, quads {:.0}, upload {:.2} MB/s, {width}x{height}",
                 frames / seconds,
                 seconds * 1000.0 / frames,
                 self.worst_frame_ms,
                 self.cpu_ms / frames,
+                self.wait_ms / frames,
                 self.draws as f64 / frames,
                 self.quads as f64 / frames,
+                self.upload_bytes as f64 / seconds / 1_048_576.0,
             );
             let last = self.last_frame_at;
             *self = Self::new();

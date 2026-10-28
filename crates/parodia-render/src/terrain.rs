@@ -10,9 +10,15 @@
 //!
 //! Вершин в обычном смысле нет (vertex pulling): шейдер сам читает квад и строит 6 вершин.
 //! Каждый чанк рисуется одним вызовом `vkCmdDraw(квады × 6, 1, первый_квад × 6, слот)`.
-//! Такой вызов один в один ложится в indirect-отрисовку (этап 5): видеокарта сама будет
-//! составлять список вызовов после отсечения.
+//! Такой вызов один в один ложится в indirect-отрисовку (этап 5).
+//!
+//! **Загрузка мешей без ожидания.** `queue_upload` сразу выдаёт место в пуле и слот, а данные
+//! кладёт в очередь. В начале каждого кадра (`record_uploads`, после того как видеокарта закончила
+//! прошлый кадр этого слота) данные копируются в «свою» часть промежуточного буфера и в команды
+//! кадра записываются копирования — не больше бюджета байт за кадр. Чанк начинает рисоваться
+//! в том же кадре, когда его данные скопированы. Процессор никогда не ждёт видеокарту.
 
+use std::collections::VecDeque;
 use std::io::Cursor;
 
 use anyhow::{Context as _, Result, bail};
@@ -27,8 +33,8 @@ use crate::resources::{GpuBuffer, SharedAllocator};
 pub const POOL_QUADS: u32 = 8 * 1024 * 1024;
 /// Сколько чанков с мешем может быть одновременно.
 pub const MAX_CHUNK_SLOTS: u32 = 65_536;
-/// Размер промежуточного буфера для загрузки (процессор → видеокарта).
-const STAGING_BYTES: u64 = 16 * 1024 * 1024;
+/// Часть промежуточного буфера на один кадр «в полёте» = бюджет загрузки за кадр.
+pub const UPLOAD_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 const QUAD_BYTES: u64 = 8;
 const SLOT_BYTES: u64 = 16;
 
@@ -51,16 +57,30 @@ pub struct TerrainPush {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkMeshId(pub u32);
 
-/// Один чанк для загрузки: угол чанка относительно точки отсчёта рендера и его квады.
-pub struct ChunkUpload<'a> {
-    pub origin: [i32; 3],
-    pub quads: &'a [u32],
+/// Итог постановки меша в очередь загрузки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkUpload {
+    /// Место выдано; чанк появится на экране, когда данные скопируются (обычно в ближайший кадр).
+    Queued(ChunkMeshId),
+    /// Меш пустой — рисовать нечего.
+    Empty,
+    /// Пул геометрии или таблица чанков переполнены.
+    PoolFull,
 }
 
 #[derive(Clone, Copy)]
 struct ChunkDraw {
     first_quad: u32,
     quad_count: u32,
+    /// Данные уже скопированы в видеопамять — можно рисовать.
+    ready: bool,
+}
+
+/// Меш, ждущий копирования в видеопамять.
+struct PendingUpload {
+    slot: u32,
+    origin: [i32; 3],
+    quads: Vec<u32>,
 }
 
 /// Счётчики для экрана F3.
@@ -70,16 +90,21 @@ pub struct TerrainStats {
     pub quads_resident: u64,
     pub pool_used_quads: u32,
     pub pool_capacity_quads: u32,
+    /// Мешей в очереди на копирование.
+    pub pending_uploads: u32,
 }
 
 pub struct Terrain {
     pool: GpuBuffer,
     chunk_table: GpuBuffer,
     colors: GpuBuffer,
+    /// Промежуточный буфер: по `UPLOAD_BUDGET_BYTES` на каждый кадр «в полёте».
     staging: GpuBuffer,
+    frames_in_flight: usize,
     ranges: RangeAllocator,
     free_slots: Vec<u32>,
     draws: Vec<Option<ChunkDraw>>,
+    pending: VecDeque<PendingUpload>,
     live_chunks: u32,
     resident_quads: u64,
     /// Чанки, удалённые в кадре N: (кадр, слот, меш). Слот и место в пуле освобождаются,
@@ -100,6 +125,7 @@ impl Terrain {
         color_format: vk::Format,
         depth_format: vk::Format,
         face_culling: bool,
+        frames_in_flight: usize,
     ) -> Result<Self> {
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let pool = GpuBuffer::new(
@@ -129,7 +155,7 @@ impl Terrain {
         let staging = GpuBuffer::new(
             device,
             allocator,
-            STAGING_BYTES,
+            UPLOAD_BUDGET_BYTES * frames_in_flight as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryLocation::CpuToGpu,
             "terrain staging",
@@ -214,9 +240,11 @@ impl Terrain {
             chunk_table,
             colors,
             staging,
+            frames_in_flight,
             ranges: RangeAllocator::new(POOL_QUADS),
             free_slots: (0..MAX_CHUNK_SLOTS).rev().collect(),
             draws: vec![None; MAX_CHUNK_SLOTS as usize],
+            pending: VecDeque::new(),
             live_chunks: 0,
             resident_quads: 0,
             retired: Vec::new(),
@@ -249,7 +277,8 @@ impl Terrain {
         Ok(())
     }
 
-    /// Загружает цвета блоков (линейные RGBA). TEMPORARY: до появления текстур.
+    /// Загружает цвета блоков (линейные RGBA). Вызывается один раз при запуске, до первого кадра,
+    /// поэтому здесь допустимо дождаться видеокарты. TEMPORARY: до появления текстур.
     pub fn set_block_colors(
         &mut self,
         device: &Device,
@@ -258,100 +287,82 @@ impl Terrain {
         colors: &[[f32; 4]],
     ) -> Result<()> {
         let bytes: &[u8] = bytemuck::cast_slice(colors);
-        if bytes.len() as u64 > self.colors.size {
+        if bytes.len() as u64 > self.colors.size || bytes.len() as u64 > UPLOAD_BUDGET_BYTES {
             bail!("too many block colors");
         }
         self.write_staging(0, bytes)?;
         let region = [vk::BufferCopy::default().size(bytes.len() as u64)];
-        submit_copies(
-            device,
-            queue,
-            command_pool,
-            &[(self.staging.buffer, self.colors.buffer, &region[..])],
-        )
-    }
-
-    /// Загружает меши чанков. TEMPORARY: загрузка синхронная (ждём видеокарту) — на этапе 4
-    /// её заменит загрузка с ограничением объёма за кадр, без ожидания.
-    /// Возвращает номер каждого чанка (`None` — чанк пустой или не хватило места в пуле).
-    pub fn upload(
-        &mut self,
-        device: &Device,
-        queue: vk::Queue,
-        command_pool: vk::CommandPool,
-        chunks: &[ChunkUpload<'_>],
-    ) -> Result<Vec<Option<ChunkMeshId>>> {
-        let mut result = Vec::with_capacity(chunks.len());
-        let mut pool_copies: Vec<vk::BufferCopy> = Vec::new();
-        let mut table_copies: Vec<vk::BufferCopy> = Vec::new();
-        let mut staged: u64 = 0;
-
-        for chunk in chunks {
-            let quad_count = (chunk.quads.len() / 2) as u32;
-            if quad_count == 0 {
-                result.push(None);
-                continue;
-            }
-            let bytes: &[u8] = bytemuck::cast_slice(chunk.quads);
-            let needed = bytes.len() as u64 + SLOT_BYTES;
-            if needed > STAGING_BYTES {
-                log::warn!("chunk mesh too large for staging ({} bytes), skipped", bytes.len());
-                result.push(None);
-                continue;
-            }
-            if staged + needed > STAGING_BYTES {
-                self.flush(device, queue, command_pool, &mut pool_copies, &mut table_copies)?;
-                staged = 0;
-            }
-            let Some(first_quad) = self.ranges.alloc(quad_count) else {
-                log::warn!("terrain geometry pool is full; chunk not uploaded");
-                result.push(None);
-                continue;
-            };
-            let Some(slot) = self.free_slots.pop() else {
-                self.ranges.free(first_quad, quad_count);
-                log::warn!("no free chunk slots; chunk not uploaded");
-                result.push(None);
-                continue;
-            };
-
-            self.write_staging(staged, bytes)?;
-            pool_copies.push(
-                vk::BufferCopy::default()
-                    .src_offset(staged)
-                    .dst_offset(first_quad as u64 * QUAD_BYTES)
-                    .size(bytes.len() as u64),
-            );
-            staged += bytes.len() as u64;
-
-            let origin = [chunk.origin[0], chunk.origin[1], chunk.origin[2], 0i32];
-            self.write_staging(staged, bytemuck::cast_slice(&origin))?;
-            table_copies.push(
-                vk::BufferCopy::default()
-                    .src_offset(staged)
-                    .dst_offset(slot as u64 * SLOT_BYTES)
-                    .size(SLOT_BYTES),
-            );
-            staged += SLOT_BYTES;
-
-            self.draws[slot as usize] = Some(ChunkDraw {
-                first_quad,
-                quad_count,
-            });
-            self.live_chunks += 1;
-            self.resident_quads += quad_count as u64;
-            result.push(Some(ChunkMeshId(slot)));
+        // SAFETY: init-time only; we wait for the queue before returning.
+        unsafe {
+            let cmd = device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            device.cmd_copy_buffer(cmd, self.staging.buffer, self.colors.buffer, &region);
+            record_upload_barrier(device, cmd);
+            device.end_command_buffer(cmd)?;
+            let buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+            let submit = vk::SubmitInfo2::default().command_buffer_infos(&buffers);
+            device.queue_submit2(queue, &[submit], vk::Fence::null())?;
+            device.queue_wait_idle(queue)?;
+            device.free_command_buffers(command_pool, &[cmd]);
         }
-        self.flush(device, queue, command_pool, &mut pool_copies, &mut table_copies)?;
-        Ok(result)
+        Ok(())
     }
 
-    /// Убирает чанк. Место в пуле освободится, когда закончится кадр `frame`.
+    /// Ставит меш чанка в очередь загрузки. Возвращает сразу, видеокарту не ждёт.
+    pub fn queue_upload(&mut self, origin: [i32; 3], quads: Vec<u32>) -> ChunkUpload {
+        let quad_count = (quads.len() / 2) as u32;
+        if quad_count == 0 {
+            return ChunkUpload::Empty;
+        }
+        if quad_count as u64 * QUAD_BYTES + SLOT_BYTES > UPLOAD_BUDGET_BYTES {
+            log::warn!("chunk mesh with {quad_count} quads is larger than the upload budget");
+            return ChunkUpload::PoolFull;
+        }
+        let Some(first_quad) = self.ranges.alloc(quad_count) else {
+            return ChunkUpload::PoolFull;
+        };
+        let Some(slot) = self.free_slots.pop() else {
+            self.ranges.free(first_quad, quad_count);
+            return ChunkUpload::PoolFull;
+        };
+        self.draws[slot as usize] = Some(ChunkDraw {
+            first_quad,
+            quad_count,
+            ready: false,
+        });
+        self.live_chunks += 1;
+        self.resident_quads += quad_count as u64;
+        self.pending.push_back(PendingUpload {
+            slot,
+            origin,
+            quads,
+        });
+        ChunkUpload::Queued(ChunkMeshId(slot))
+    }
+
+    /// Убирает чанк. Если его данные ещё не были скопированы — место освобождается сразу;
+    /// иначе — когда видеокарта закончит кадр `frame` (последний, который мог его рисовать).
     pub fn remove(&mut self, id: ChunkMeshId, frame: u64) {
-        if let Some(draw) = self.draws[id.0 as usize].take() {
-            self.live_chunks -= 1;
-            self.resident_quads -= draw.quad_count as u64;
+        let Some(draw) = self.draws[id.0 as usize].take() else {
+            return;
+        };
+        self.live_chunks -= 1;
+        self.resident_quads -= draw.quad_count as u64;
+        if draw.ready {
             self.retired.push((frame, id.0, draw));
+        } else {
+            self.pending.retain(|p| p.slot != id.0);
+            self.ranges.free(draw.first_quad, draw.quad_count);
+            self.free_slots.push(id.0);
         }
     }
 
@@ -370,7 +381,70 @@ impl Terrain {
         });
     }
 
-    /// Записывает отрисовку всех чанков. Возвращает (число вызовов, число квадов).
+    /// Копирует ожидающие меши в промежуточный буфер кадра `frame_slot` и записывает в `cmd`
+    /// копирование в видеопамять (не больше бюджета). Вызывать после ожидания fence этого слота,
+    /// до начала отрисовки. Возвращает число скопированных байт.
+    pub fn record_uploads(
+        &mut self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+    ) -> Result<u64> {
+        if self.pending.is_empty() {
+            return Ok(0);
+        }
+        let base = UPLOAD_BUDGET_BYTES * (frame_slot % self.frames_in_flight) as u64;
+        let mut used = 0u64;
+        let mut pool_copies = Vec::new();
+        let mut table_copies = Vec::new();
+
+        while let Some(upload) = self.pending.front() {
+            let bytes: &[u8] = bytemuck::cast_slice(&upload.quads);
+            let needed = bytes.len() as u64 + SLOT_BYTES;
+            if used + needed > UPLOAD_BUDGET_BYTES {
+                break;
+            }
+            let Some(upload) = self.pending.pop_front() else {
+                break;
+            };
+            let Some(draw) = self.draws[upload.slot as usize].as_mut() else {
+                continue; // чанк уже убран
+            };
+            let bytes: &[u8] = bytemuck::cast_slice(&upload.quads);
+            let offset = base + used;
+            write_mapped(&mut self.staging, offset, bytes)?;
+            pool_copies.push(
+                vk::BufferCopy::default()
+                    .src_offset(offset)
+                    .dst_offset(draw.first_quad as u64 * QUAD_BYTES)
+                    .size(bytes.len() as u64),
+            );
+            used += bytes.len() as u64;
+
+            let origin = [upload.origin[0], upload.origin[1], upload.origin[2], 0i32];
+            write_mapped(&mut self.staging, base + used, bytemuck::cast_slice(&origin))?;
+            table_copies.push(
+                vk::BufferCopy::default()
+                    .src_offset(base + used)
+                    .dst_offset(upload.slot as u64 * SLOT_BYTES)
+                    .size(SLOT_BYTES),
+            );
+            used += SLOT_BYTES;
+            draw.ready = true;
+        }
+
+        if !pool_copies.is_empty() {
+            // SAFETY: cmd is recording outside a rendering scope; regions lie within the buffers.
+            unsafe {
+                device.cmd_copy_buffer(cmd, self.staging.buffer, self.pool.buffer, &pool_copies);
+                device.cmd_copy_buffer(cmd, self.staging.buffer, self.chunk_table.buffer, &table_copies);
+                record_upload_barrier(device, cmd);
+            }
+        }
+        Ok(used)
+    }
+
+    /// Записывает отрисовку всех готовых чанков. Возвращает (число вызовов, число квадов).
     pub fn record(
         &self,
         device: &Device,
@@ -413,7 +487,9 @@ impl Terrain {
             device.cmd_set_viewport(cmd, 0, &[viewport]);
             device.cmd_set_scissor(cmd, 0, &[scissor]);
             for (slot, draw) in self.draws.iter().enumerate() {
-                if let Some(draw) = draw {
+                if let Some(draw) = draw
+                    && draw.ready
+                {
                     device.cmd_draw(cmd, draw.quad_count * 6, 1, draw.first_quad * 6, slot as u32);
                     draws += 1;
                     quads += draw.quad_count as u64;
@@ -429,6 +505,7 @@ impl Terrain {
             quads_resident: self.resident_quads,
             pool_used_quads: self.ranges.used(),
             pool_capacity_quads: self.ranges.capacity(),
+            pending_uploads: self.pending.len() as u32,
         }
     }
 
@@ -447,84 +524,28 @@ impl Terrain {
     }
 
     fn write_staging(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        let mapped = self
-            .staging
-            .mapped()
-            .context("staging buffer is not host-visible")?;
-        let start = offset as usize;
-        mapped[start..start + bytes.len()].copy_from_slice(bytes);
-        Ok(())
-    }
-
-    fn flush(
-        &mut self,
-        device: &Device,
-        queue: vk::Queue,
-        command_pool: vk::CommandPool,
-        pool_copies: &mut Vec<vk::BufferCopy>,
-        table_copies: &mut Vec<vk::BufferCopy>,
-    ) -> Result<()> {
-        if pool_copies.is_empty() && table_copies.is_empty() {
-            return Ok(());
-        }
-        submit_copies(
-            device,
-            queue,
-            command_pool,
-            &[
-                (self.staging.buffer, self.pool.buffer, &pool_copies[..]),
-                (self.staging.buffer, self.chunk_table.buffer, &table_copies[..]),
-            ],
-        )?;
-        pool_copies.clear();
-        table_copies.clear();
-        Ok(())
+        write_mapped(&mut self.staging, offset, bytes)
     }
 }
 
-/// Копирует данные и ждёт завершения. TEMPORARY: синхронная загрузка (см. `Terrain::upload`).
-fn submit_copies(
-    device: &Device,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    copies: &[(vk::Buffer, vk::Buffer, &[vk::BufferCopy])],
-) -> Result<()> {
-    // SAFETY: the pool belongs to this device and is used only from this thread; we wait for
-    // the queue before freeing the command buffer.
-    unsafe {
-        let cmd = device.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        )?[0];
-        device.begin_command_buffer(
-            cmd,
-            &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-        for (src, dst, regions) in copies {
-            if !regions.is_empty() {
-                device.cmd_copy_buffer(cmd, *src, *dst, regions);
-            }
-        }
-        // Записанное копированием должно быть видно шейдерам при следующих отрисовках.
-        let barrier = vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ);
-        device.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().memory_barriers(&[barrier]),
-        );
-        device.end_command_buffer(cmd)?;
-        let buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-        let submit = vk::SubmitInfo2::default().command_buffer_infos(&buffers);
-        device.queue_submit2(queue, &[submit], vk::Fence::null())?;
-        device.queue_wait_idle(queue)?;
-        device.free_command_buffers(command_pool, &[cmd]);
-    }
+fn write_mapped(buffer: &mut GpuBuffer, offset: u64, bytes: &[u8]) -> Result<()> {
+    let mapped = buffer.mapped().context("staging buffer is not host-visible")?;
+    let start = offset as usize;
+    mapped[start..start + bytes.len()].copy_from_slice(bytes);
     Ok(())
+}
+
+/// Барьер: записанное копированием должно быть видно вершинному шейдеру в этом же и следующих кадрах.
+fn record_upload_barrier(device: &Device, cmd: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ);
+    // SAFETY: cmd is recording outside a rendering scope.
+    unsafe {
+        device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&[barrier]));
+    }
 }
 
 fn create_shader(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule> {

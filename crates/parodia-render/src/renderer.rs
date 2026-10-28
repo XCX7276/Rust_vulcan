@@ -72,8 +72,12 @@ pub struct UiFrame<'a> {
 /// Замеры одного кадра.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
-    /// Сколько процессор потратил на подготовку и отправку кадра (мс).
+    /// Сколько процессор работал над кадром (мс), без ожидания видеокарты и монитора.
     pub cpu_ms: f32,
+    /// Сколько процессор ждал: прошлый кадр этого слота и свободную картинку (при VSync — монитор).
+    pub wait_ms: f32,
+    /// Сколько байт мешей скопировано в видеопамять в этом кадре.
+    pub upload_bytes: u64,
     /// Сколько видеокарта рисовала кадр (мс); приходит с задержкой в пару кадров.
     pub gpu_ms: Option<f32>,
     /// Сколько вызовов отрисовки ландшафта.
@@ -268,10 +272,13 @@ impl Renderer {
         terrain.set_block_colors(&self.ctx.device, self.ctx.queue, self.upload_pool, colors)
     }
 
-    /// Загружает меши чанков в видеопамять.
-    pub fn upload_chunks(&mut self, chunks: &[ChunkUpload<'_>]) -> Result<Vec<Option<ChunkMeshId>>> {
-        let terrain = self.terrain.as_mut().context("terrain renderer is not ready")?;
-        terrain.upload(&self.ctx.device, self.ctx.queue, self.upload_pool, chunks)
+    /// Ставит меш чанка в очередь загрузки в видеопамять (без ожидания).
+    /// `origin` — угол чанка относительно точки отсчёта рендера; `quads` — по 2 слова на квад.
+    pub fn upload_chunk(&mut self, origin: [i32; 3], quads: Vec<u32>) -> ChunkUpload {
+        match self.terrain.as_mut() {
+            Some(terrain) => terrain.queue_upload(origin, quads),
+            None => ChunkUpload::PoolFull,
+        }
     }
 
     /// Убирает меш чанка (место освободится, когда видеокарта закончит текущие кадры).
@@ -306,8 +313,10 @@ impl Renderer {
         let frame = &self.frames[slot];
 
         // 1. Ждём завершения прошлого кадра этого слота.
+        let wait_started = Instant::now();
         // SAFETY: fence belongs to this device.
         unsafe { device.wait_for_fences(&[frame.in_flight], true, u64::MAX) }?;
+        let mut wait = wait_started.elapsed();
         if let Some(timer) = &self.timer
             && let Some(ms) = timer.read(device, slot)
         {
@@ -335,6 +344,7 @@ impl Renderer {
         }
 
         // 2. Берём свободную картинку swapchain.
+        let acquire_started = Instant::now();
         // SAFETY: swapchain and semaphore are valid; the semaphore is unsignaled (its last wait completed).
         let acquired = unsafe {
             self.swapchain_loader.acquire_next_image(
@@ -352,6 +362,7 @@ impl Renderer {
             }
             Err(error) => return Err(error).context("vkAcquireNextImageKHR failed"),
         };
+        wait += acquire_started.elapsed();
         let image = swapchain.images[image_index as usize];
         let view = swapchain.views[image_index as usize];
         let render_finished = swapchain.render_finished[image_index as usize];
@@ -374,6 +385,11 @@ impl Renderer {
         if let Some(timer) = self.timer.as_mut() {
             timer.begin(device, cmd, slot);
         }
+        // Меши, ждущие загрузки, копируются в начале кадра (до отрисовки), в пределах бюджета.
+        let upload_bytes = match self.terrain.as_mut() {
+            Some(terrain) => terrain.record_uploads(device, cmd, slot)?,
+            None => 0,
+        };
 
         // Картинка: «неизвестное содержимое» → «в неё рисуем».
         let to_attachment = vk::ImageMemoryBarrier2::default()
@@ -509,7 +525,8 @@ impl Renderer {
             .context("vkQueueSubmit2 failed")?;
         self.frame_number += 1;
         self.frames[slot].frame_number = self.frame_number;
-        let cpu_ms = started.elapsed().as_secs_f32() * 1000.0;
+        let cpu_ms = (started.elapsed().saturating_sub(wait)).as_secs_f32() * 1000.0;
+        let wait_ms = wait.as_secs_f32() * 1000.0;
 
         let present_waits = [render_finished];
         let swapchains = [swapchain.handle];
@@ -537,6 +554,8 @@ impl Renderer {
 
         Ok(Some(FrameStats {
             cpu_ms,
+            wait_ms,
+            upload_bytes,
             gpu_ms: self.last_gpu_ms,
             terrain_draws,
             terrain_quads,
@@ -595,6 +614,7 @@ impl Renderer {
                     format,
                     DEPTH_FORMAT,
                     self.face_culling,
+                    FRAMES_IN_FLIGHT,
                 )?);
             }
             Some(terrain) if format_changed => {

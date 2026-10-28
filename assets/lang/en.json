@@ -1,7 +1,7 @@
 {
   "debug.title": "Debug (F3)",
   "debug.frame": "{fps} FPS, frame {ms} ms",
-  "debug.cpu_time": "CPU per frame: {ms} ms",
+  "debug.cpu_time": "CPU per frame: {ms} ms (waiting {wait} ms)",
   "debug.gpu_time": "GPU per frame: {ms} ms",
   "debug.gpu_time_none": "GPU per frame: no data",
   "debug.gpu": "GPU: {name} ({kind})",
@@ -25,5 +25,8 @@
   "debug.terrain": "Terrain: {chunks} chunks, {draws} draws, {quads} quads",
   "debug.pool": "Geometry pool used: {percent}%",
   "hint.capture": "LMB — control camera, Esc — release mouse",
-  "hint.fly": "WASD — fly, Space / Ctrl — up / down, Shift — faster"
+  "hint.fly": "WASD — fly, Space / Ctrl — up / down, Shift — faster",
+  "debug.stream": "World: {loaded} chunks in memory, {meshed} with mesh",
+  "debug.jobs": "Jobs: generating {generating}, meshing {meshing}, queued {queued}, to GPU {uploads}, {workers} threads",
+  "debug.job_time": "Time: generate {generate} ms, mesh {mesh} ms, streamer {stream} ms/frame, upload {upload} KB/frame"
 }
