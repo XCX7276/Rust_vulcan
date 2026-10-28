@@ -1,0 +1,18 @@
+# parodia-render — всё, что касается Vulkan: видеокарта, цепочка показа кадров (swapchain),
+# запись команд кадра, замер времени на видеокарте, отрисовка отладочного интерфейса.
+[package]
+name = "parodia-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ash.workspace = true
+ash-window.workspace = true
+raw-window-handle.workspace = true
+gpu-allocator.workspace = true
+egui.workspace = true
+egui-ash-renderer.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+anyhow.workspace = true

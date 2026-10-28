@@ -1,0 +1,8 @@
+{
+  "blocks": [
+    { "id": "air", "render": "invisible", "solid": false, "color": [0.0, 0.0, 0.0] },
+    { "id": "stone", "render": "opaque", "solid": true, "color": [0.50, 0.50, 0.52] },
+    { "id": "dirt", "render": "opaque", "solid": true, "color": [0.47, 0.33, 0.21] },
+    { "id": "grass", "render": "opaque", "solid": true, "color": [0.36, 0.58, 0.24] }
+  ]
+}

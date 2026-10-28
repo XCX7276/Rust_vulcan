@@ -1,0 +1,9 @@
+# parodia-mesh — построение моделей чанков (квадов) из блоков: binary greedy meshing.
+[package]
+name = "parodia-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+parodia-world.workspace = true

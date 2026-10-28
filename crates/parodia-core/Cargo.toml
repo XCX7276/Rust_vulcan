@@ -1,0 +1,9 @@
+# parodia-core — общие вещи без графики: флаги окружения, журнал (логи), счётчик кадров.
+[package]
+name = "parodia-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true

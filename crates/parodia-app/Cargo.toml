@@ -1,0 +1,23 @@
+# parodia-app — запускаемая программа: окно, цикл кадров, ввод, связывает остальные модули.
+[package]
+name = "parodia-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "parodia"
+path = "src/main.rs"
+
+[dependencies]
+parodia-core.workspace = true
+parodia-render.workspace = true
+parodia-ui.workspace = true
+parodia-world.workspace = true
+parodia-mesh.workspace = true
+glam.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+log.workspace = true
+anyhow.workspace = true

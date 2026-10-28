@@ -1,0 +1,10 @@
+# parodia-world — мир без графики: координаты, блоки, чанки (дальше — генерация и правки).
+[package]
+name = "parodia-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true

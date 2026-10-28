@@ -1,0 +1,11 @@
+# parodia-ui — интерфейс: переводы (ru/en) и экраны. Сейчас — экран отладки F3.
+[package]
+name = "parodia-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
