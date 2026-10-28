@@ -3,8 +3,8 @@
 //! Шаги для одного чанка:
 //! 1. Собираем «расширенный» куб 34×34×34: сам чанк в середине (1..=32) и по одному слою
 //!    от каждого из 6 соседей по краям — чтобы знать, закрыта ли грань на границе чанка.
-//!    Если соседа ещё нет, считаем там воздух (грань рисуется; её уберёт перемешивание,
-//!    когда сосед появится — этап 4).
+//!    Если соседа нет (`None`), считаем там воздух и грань рисуется. Стример строит модель
+//!    только когда все соседи уже сгенерированы, поэтому `None` бывает лишь за краем мира по высоте.
 //! 2. Для каждой оси строим «столбцы непрозрачности»: 34 бита в числе u64, бит = непрозрачный блок.
 //! 3. Грани в сторону +оси: `столбец & !(столбец >> 1)` (блок есть, а следующий пустой);
 //!    в сторону −оси: `столбец & !(столбец << 1)`. Одна операция на 32 блока сразу.
@@ -19,7 +19,7 @@ use parodia_world::BlockId;
 use parodia_world::chunk::Chunk;
 use parodia_world::coords::{CHUNK_VOLUME, LocalPos};
 
-use crate::{Face, pack_quad};
+use crate::{Face, FaceCounts, pack_quad};
 
 const P: usize = 34; // сторона расширенного куба
 const P2: usize = P * P;
@@ -66,12 +66,17 @@ impl Mesher {
         }
     }
 
-    /// Строит квады чанка и дописывает их в `out` (по 2 слова u32 на квад).
+    /// Строит квады чанка и дописывает их в `out` (по 2 слова u32 на квад), группами по сторонам.
     /// `occludes[id]` — закрывает ли блок с номером `id` грани соседей (непрозрачный ли).
-    /// Возвращает число квадов.
-    pub fn mesh(&mut self, n: &Neighborhood<'_>, occludes: &[bool], out: &mut Vec<u32>) -> usize {
+    /// Возвращает число квадов каждой стороны.
+    pub fn mesh(
+        &mut self,
+        n: &Neighborhood<'_>,
+        occludes: &[bool],
+        out: &mut Vec<u32>,
+    ) -> FaceCounts {
         if !may_have_faces(n, occludes) {
-            return 0;
+            return FaceCounts::default();
         }
         self.fill_padded(n);
         self.build_columns(occludes);
@@ -182,8 +187,10 @@ impl Mesher {
         }
     }
 
-    fn merge_planes(&mut self, out: &mut Vec<u32>) -> usize {
-        let mut count = 0;
+    fn merge_planes(&mut self, out: &mut Vec<u32>) -> FaceCounts {
+        // Плоскости лежат по порядку сторон (индекс / 32 = сторона), поэтому квады
+        // сами получаются сгруппированы по сторонам.
+        let mut counts = FaceCounts::default();
         for (index, planes) in self.planes.iter_mut().enumerate() {
             let face = Face::ALL[index / 32];
             let layer = (index % 32) as u32;
@@ -219,12 +226,12 @@ impl Mesher {
                             face,
                             plane.block.0,
                         ));
-                        count += 1;
+                        counts.0[face as usize] += 1;
                     }
                 }
             }
         }
-        count
+        counts
     }
 }
 
@@ -253,9 +260,17 @@ mod tests {
 
     fn mesh(center: &Chunk, neighbors: [Option<&Chunk>; 6]) -> Vec<[u32; 2]> {
         let mut out = Vec::new();
-        let count = Mesher::new().mesh(&Neighborhood { center, neighbors }, &OCCLUDES, &mut out);
-        assert_eq!(out.len(), count * 2);
-        out.chunks(2).map(|c| [c[0], c[1]]).collect()
+        let counts = Mesher::new().mesh(&Neighborhood { center, neighbors }, &OCCLUDES, &mut out);
+        assert_eq!(out.len(), counts.total() as usize * 2);
+        let quads: Vec<[u32; 2]> = out.chunks(2).map(|c| [c[0], c[1]]).collect();
+        // Квады идут группами по сторонам, и размеры групп совпадают со счётчиками.
+        let mut start = 0;
+        for (face, &count) in counts.0.iter().enumerate() {
+            let group = &quads[start..start + count as usize];
+            assert!(group.iter().all(|q| unpack_quad(*q).5 == face as u32));
+            start += count as usize;
+        }
+        quads
     }
 
     /// Суммарная площадь граней по сторонам — независима от способа слияния.

@@ -4,8 +4,15 @@
 //! 1. ждём, пока видеокарта закончит кадр, который рисовался в этом же «слоте» 2 кадра назад
 //!    (кадров в полёте два: пока видеокарта рисует один, процессор готовит следующий);
 //! 2. берём свободную картинку из swapchain;
-//! 3. записываем команды: очистка цвета и глубины → ландшафт → отладочный интерфейс;
+//! 3. записываем команды:
+//!    - загрузка новых мешей и изменения таблицы чанков;
+//!    - ранний проход отсечения (видеокарта выбирает чанки, видимые в прошлом кадре);
+//!    - проход 1: очистка цвета и глубины → ранний список ландшафта;
+//!    - пирамида глубины и поздний проход отсечения (чанки, которые только что открылись);
+//!    - проход 2: поздний список ландшафта → отладочный интерфейс;
 //! 4. отправляем команды видеокарте и просим показать картинку в окне.
+//!
+//! Подробности отсечения — в `culling.rs`.
 //!
 //! Тени, небо, вода и прочее будут добавляться в шаг 3 на следующих этапах.
 
@@ -19,6 +26,7 @@ use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{GpuContext, GpuInfo};
+use crate::culling::{CullPass, CullSettings, CullStats, CullView, Culling};
 use crate::resources::{GpuImage, SharedAllocator, depth_range};
 use crate::swapchain::{Swapchain, color_range, is_srgb};
 use crate::terrain::{ChunkMeshId, ChunkUpload, Terrain, TerrainPush, TerrainStats};
@@ -36,8 +44,12 @@ const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 pub struct RendererConfig {
     pub vsync: bool,
     pub validation: bool,
-    /// Отсечение задних граней (выключается флагом `PARODIA_FACE_CULLING=0` для отладки).
+    /// Отсечение граней, повёрнутых от камеры (флаг `PARODIA_FACE_CULLING`).
     pub face_culling: bool,
+    /// Не рисовать чанки вне поля зрения (флаг `PARODIA_FRUSTUM_CULLING`).
+    pub frustum_culling: bool,
+    /// Не рисовать чанки, закрытые другими, — Hi-Z (флаг `PARODIA_OCCLUSION_CULLING`).
+    pub occlusion_culling: bool,
     pub width: u32,
     pub height: u32,
 }
@@ -80,10 +92,8 @@ pub struct FrameStats {
     pub upload_bytes: u64,
     /// Сколько видеокарта рисовала кадр (мс); приходит с задержкой в пару кадров.
     pub gpu_ms: Option<f32>,
-    /// Сколько вызовов отрисовки ландшафта.
-    pub terrain_draws: u32,
-    /// Сколько квадов ландшафта отправлено на отрисовку.
-    pub terrain_quads: u64,
+    /// Итог отсечения (приходит с задержкой в пару кадров).
+    pub cull: CullStats,
 }
 
 /// Ресурсы одного кадра «в полёте».
@@ -102,6 +112,11 @@ pub struct Renderer {
     ui: Option<egui_ash_renderer::Renderer<GpuAllocator>>,
     ui_format: vk::Format,
     terrain: Option<Terrain>,
+    culling: Option<Culling>,
+    cull_settings: CullSettings,
+    last_cull: CullStats,
+    /// Буфер глубины можно читать в шейдере (нужно для Hi-Z).
+    depth_sampled: bool,
     depth: Option<GpuImage>,
     allocator: Option<SharedAllocator>,
     upload_pool: vk::CommandPool,
@@ -151,6 +166,26 @@ impl Renderer {
         {
             bail!("GPU does not support D32_SFLOAT depth buffers");
         }
+        let depth_sampled = depth_props
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE);
+        if config.occlusion_culling && !depth_sampled {
+            log::warn!("GPU cannot sample D32_SFLOAT depth; occlusion culling (Hi-Z) is disabled");
+        }
+        if !ctx.info.draw_indirect_count {
+            log::warn!("vkCmdDrawIndirectCount not supported; drawing full indirect lists");
+        }
+        let cull_settings = CullSettings {
+            frustum: config.frustum_culling,
+            occlusion: config.occlusion_culling && depth_sampled,
+            faces: config.face_culling,
+        };
+        log::info!(
+            "culling: frustum={}, occlusion={}, faces={}",
+            cull_settings.frustum,
+            cull_settings.occlusion,
+            cull_settings.faces
+        );
 
         let swapchain_loader = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
         let device = &ctx.device;
@@ -211,6 +246,10 @@ impl Renderer {
             ui: None,
             ui_format: vk::Format::UNDEFINED,
             terrain: None,
+            culling: None,
+            cull_settings,
+            last_cull: CullStats::default(),
+            depth_sampled,
             depth: None,
             allocator: Some(Arc::new(Mutex::new(allocator))),
             upload_pool,
@@ -273,10 +312,16 @@ impl Renderer {
     }
 
     /// Ставит меш чанка в очередь загрузки в видеопамять (без ожидания).
-    /// `origin` — угол чанка относительно точки отсчёта рендера; `quads` — по 2 слова на квад.
-    pub fn upload_chunk(&mut self, origin: [i32; 3], quads: Vec<u32>) -> ChunkUpload {
+    /// `origin` — угол чанка относительно точки отсчёта рендера; `quads` — по 2 слова на квад,
+    /// группами по сторонам; `faces` — число квадов каждой стороны.
+    pub fn upload_chunk(
+        &mut self,
+        origin: [i32; 3],
+        quads: Vec<u32>,
+        faces: [u32; 6],
+    ) -> ChunkUpload {
         match self.terrain.as_mut() {
-            Some(terrain) => terrain.queue_upload(origin, quads),
+            Some(terrain) => terrain.queue_upload(origin, quads, faces),
             None => ChunkUpload::PoolFull,
         }
     }
@@ -284,8 +329,13 @@ impl Renderer {
     /// Убирает меш чанка (место освободится, когда видеокарта закончит текущие кадры).
     pub fn remove_chunk(&mut self, id: ChunkMeshId) {
         if let Some(terrain) = self.terrain.as_mut() {
-            terrain.remove(id, self.frame_number);
+            terrain.remove(id);
         }
+    }
+
+    /// Какие уровни отсечения включены (для F3).
+    pub fn cull_settings(&self) -> CullSettings {
+        self.cull_settings
     }
 
     /// Рисует и показывает один кадр. `Ok(None)` — кадр пропущен (окно свёрнуто или пересоздаётся swapchain).
@@ -325,6 +375,9 @@ impl Renderer {
         // Кадр этого слота (и все более ранние) завершён — освобождаем то, что ждало его окончания.
         if let Some(terrain) = self.terrain.as_mut() {
             terrain.release_retired(frame.frame_number);
+        }
+        if let Some(stats) = self.culling.as_mut().and_then(|c| c.read_stats(slot)) {
+            self.last_cull = stats;
         }
 
         // Удаляем текстуры интерфейса, которые этот слот больше не использует.
@@ -385,11 +438,27 @@ impl Renderer {
         if let Some(timer) = self.timer.as_mut() {
             timer.begin(device, cmd, slot);
         }
-        // Меши, ждущие загрузки, копируются в начале кадра (до отрисовки), в пределах бюджета.
+        // Меши, ждущие загрузки, копируются в начале кадра (до отсечения), в пределах бюджета.
+        let recording_frame = self.frame_number + 1;
         let upload_bytes = match self.terrain.as_mut() {
-            Some(terrain) => terrain.record_uploads(device, cmd, slot)?,
+            Some(terrain) => terrain.record_uploads(device, cmd, slot, recording_frame)?,
             None => 0,
         };
+        let slot_limit = self.terrain.as_ref().map_or(0, Terrain::slot_limit);
+        let cull_view = scene.map(|s| CullView {
+            view_proj: s.view_proj,
+            camera_block: s.camera_block,
+            camera_frac: s.camera_frac,
+        });
+        // Ранний проход отсечения: что было видно в прошлом кадре (или всё в поле зрения без Hi-Z).
+        let mut culled = false;
+        if let Some(culling) = self.culling.as_mut() {
+            culling.begin_frame(device, cmd, slot_limit);
+            if let Some(view) = &cull_view {
+                culling.cull(device, cmd, CullPass::Early, view, slot_limit);
+                culled = true;
+            }
+        }
 
         // Картинка: «неизвестное содержимое» → «в неё рисуем».
         let to_attachment = vk::ImageMemoryBarrier2::default()
@@ -401,9 +470,13 @@ impl Renderer {
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(image)
             .subresource_range(color_range());
-        // Глубина одна на все кадры: ждём, пока прошлый кадр закончит с ней работать.
+        // Глубина одна на все кадры: ждём, пока прошлый кадр закончит с ней работать
+        // (рисование или чтение при построении пирамиды).
         let depth_barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+            .src_stage_mask(
+                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            )
             .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
             .dst_stage_mask(
                 vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
@@ -423,32 +496,72 @@ impl Renderer {
                 float32: [sky[0], sky[1], sky[2], 1.0],
             },
         };
-        let color_attachments = [vk::RenderingAttachmentInfo::default()
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        };
+        // Проход 1: очистка + ранний список. Глубину сохраняем — из неё строится пирамида,
+        // и в неё дорисовывает проход 2.
+        let early_color = [vk::RenderingAttachmentInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(clear)];
         // Обратная глубина: очищаем нулём («бесконечно далеко»).
-        let depth_attachment = vk::RenderingAttachmentInfo::default()
+        let early_depth = vk::RenderingAttachmentInfo::default()
             .image_view(depth.view)
             .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
                     depth: 0.0,
                     stencil: 0,
                 },
             });
-        let rendering = vk::RenderingInfo::default()
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent,
-            })
+        let early_rendering = vk::RenderingInfo::default()
+            .render_area(render_area)
             .layer_count(1)
-            .color_attachments(&color_attachments)
-            .depth_attachment(&depth_attachment);
+            .color_attachments(&early_color)
+            .depth_attachment(&early_depth);
+        // Проход 2: поздний список + интерфейс поверх того, что нарисовано в проходе 1.
+        let late_color = [vk::RenderingAttachmentInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let late_depth = vk::RenderingAttachmentInfo::default()
+            .image_view(depth.view)
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE);
+        let late_rendering = vk::RenderingInfo::default()
+            .render_area(render_area)
+            .layer_count(1)
+            .color_attachments(&late_color)
+            .depth_attachment(&late_depth);
+        // Между проходами: всё нарисованное в проходе 1 должно быть видно проходу 2.
+        let between_passes = vk::MemoryBarrier2::default()
+            .src_stage_mask(
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .src_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .dst_stage_mask(
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .dst_access_mask(
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            );
         // Картинка: «в неё рисовали» → «готова к показу».
         let to_present = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -460,43 +573,76 @@ impl Renderer {
             .image(image)
             .subresource_range(color_range());
 
+        let terrain_push = scene.map(|scene| TerrainPush {
+            view_proj: scene.view_proj,
+            camera_block: [
+                scene.camera_block[0],
+                scene.camera_block[1],
+                scene.camera_block[2],
+                0,
+            ],
+            camera_frac: [
+                scene.camera_frac[0],
+                scene.camera_frac[1],
+                scene.camera_frac[2],
+                scene.fog_distance,
+            ],
+            sun_dir: [scene.sun_dir[0], scene.sun_dir[1], scene.sun_dir[2], 0.0],
+            fog_color: [scene.sky_color[0], scene.sky_color[1], scene.sky_color[2], 1.0],
+        });
+
         // SAFETY: cmd is recording; all referenced objects are alive for this frame.
         unsafe {
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_attachment, depth_barrier]),
             );
-            device.cmd_begin_rendering(cmd, &rendering);
+            device.cmd_begin_rendering(cmd, &early_rendering);
+        }
+        if let (Some(terrain), Some(culling), Some(push), true) =
+            (self.terrain.as_ref(), self.culling.as_ref(), &terrain_push, culled)
+        {
+            let list = culling.list(CullPass::Early);
+            terrain.record(device, cmd, extent, push, &list, culling.draw_count_supported());
+        }
+        // SAFETY: cmd is recording inside the rendering scope begun above.
+        unsafe { device.cmd_end_rendering(cmd) };
+
+        // Hi-Z: пирамида из глубины прохода 1, затем поздний проход отсечения.
+        let late = culled && self.culling.as_ref().is_some_and(Culling::occlusion);
+        if late
+            && let (Some(culling), Some(view)) = (self.culling.as_ref(), &cull_view)
+        {
+            culling.build_pyramid(device, cmd, depth.image, extent);
+            culling.cull(device, cmd, CullPass::Late, view, slot_limit);
+            culling.restore_depth(device, cmd, depth.image);
         }
 
-        let (mut terrain_draws, mut terrain_quads) = (0, 0);
-        if let (Some(terrain), Some(scene)) = (self.terrain.as_ref(), scene) {
-            let push = TerrainPush {
-                view_proj: scene.view_proj,
-                camera_block: [
-                    scene.camera_block[0],
-                    scene.camera_block[1],
-                    scene.camera_block[2],
-                    0,
-                ],
-                camera_frac: [
-                    scene.camera_frac[0],
-                    scene.camera_frac[1],
-                    scene.camera_frac[2],
-                    scene.fog_distance,
-                ],
-                sun_dir: [scene.sun_dir[0], scene.sun_dir[1], scene.sun_dir[2], 0.0],
-                fog_color: [scene.sky_color[0], scene.sky_color[1], scene.sky_color[2], 1.0],
-            };
-            (terrain_draws, terrain_quads) = terrain.record(device, cmd, extent, &push);
+        // SAFETY: cmd is recording outside a rendering scope.
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&[between_passes]),
+            );
+            device.cmd_begin_rendering(cmd, &late_rendering);
         }
-
+        if let (Some(terrain), Some(culling), Some(push), true) =
+            (self.terrain.as_ref(), self.culling.as_ref(), &terrain_push, late)
+        {
+            let list = culling.list(CullPass::Late);
+            terrain.record(device, cmd, extent, push, &list, culling.draw_count_supported());
+        }
         if let (Some(ui_renderer), Some(ui)) = (self.ui.as_mut(), &ui) {
             ui_renderer.cmd_draw(cmd, extent, ui.pixels_per_point, ui.primitives)?;
         }
         // SAFETY: cmd is recording inside the rendering scope begun above.
+        unsafe { device.cmd_end_rendering(cmd) };
+
+        if culled && let Some(culling) = self.culling.as_mut() {
+            culling.copy_stats(device, cmd, slot);
+        }
+        // SAFETY: cmd is recording outside a rendering scope.
         unsafe {
-            device.cmd_end_rendering(cmd);
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_present]),
@@ -557,8 +703,7 @@ impl Renderer {
             wait_ms,
             upload_bytes,
             gpu_ms: self.last_gpu_ms,
-            terrain_draws,
-            terrain_quads,
+            cull: self.last_cull,
         }))
     }
 
@@ -598,12 +743,15 @@ impl Renderer {
         else {
             return Ok(());
         };
-        self.depth = Some(GpuImage::depth(
+        let depth = GpuImage::depth(
             &self.ctx.device,
             &allocator,
             DEPTH_FORMAT,
             extent,
-        )?);
+            self.depth_sampled,
+        )?;
+        let depth_view = depth.view;
+        self.depth = Some(depth);
 
         let format_changed = self.ui_format != format;
         match self.terrain.as_mut() {
@@ -621,6 +769,22 @@ impl Renderer {
                 terrain.recreate_pipeline(&self.ctx.device, format, DEPTH_FORMAT)?;
             }
             Some(_) => {}
+        }
+        if self.culling.is_none()
+            && let Some(terrain) = self.terrain.as_ref()
+        {
+            self.culling = Some(Culling::new(
+                &self.ctx.device,
+                &allocator,
+                terrain.chunk_table(),
+                self.cull_settings,
+                self.ctx.info.draw_indirect_count,
+                self.depth_sampled,
+                FRAMES_IN_FLIGHT,
+            )?);
+        }
+        if let Some(culling) = self.culling.as_mut() {
+            culling.resize(&self.ctx.device, &allocator, depth_view, extent)?;
         }
         self.ensure_ui_renderer(format)?;
         Ok(())
@@ -666,6 +830,9 @@ impl Drop for Renderer {
         }
         self.ui = None;
         if let Some(allocator) = self.allocator.clone() {
+            if let Some(mut culling) = self.culling.take() {
+                culling.destroy(device, &allocator);
+            }
             if let Some(mut terrain) = self.terrain.take() {
                 terrain.destroy(device, &allocator);
             }

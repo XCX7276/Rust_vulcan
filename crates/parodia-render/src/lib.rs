@@ -7,11 +7,13 @@
 //! - `resources.rs` — буферы и картинки в видеопамяти;
 //! - `range_alloc.rs` — раздача мест внутри одного большого буфера;
 //! - `terrain.rs`   — пул геометрии чанков, таблица чанков и конвейер отрисовки ландшафта;
+//! - `culling.rs`   — отсечение невидимого на видеокарте: поле зрения, Hi-Z, стороны граней;
 //! - `renderer.rs`  — главный объект: каждый кадр записывает команды, отправляет их видеокарте и показывает результат.
 //!
 //! Снаружи модуль используется только через `Renderer`.
 
 mod context;
+mod culling;
 mod range_alloc;
 mod renderer;
 mod resources;
@@ -21,5 +23,6 @@ mod timing;
 
 pub use ash::vk;
 pub use context::GpuInfo;
+pub use culling::{CullSettings, CullStats};
 pub use renderer::{FrameStats, Renderer, RendererConfig, SceneView, UiFrame};
 pub use terrain::{ChunkMeshId, ChunkUpload, TerrainStats, UPLOAD_BUDGET_BYTES};

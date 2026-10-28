@@ -2,7 +2,8 @@
 //!
 //! Раз в 10 секунд пишет в журнал средние значения:
 //! `perf: <FPS> fps, frame <мс> (worst <худший кадр>), cpu <работа мс>, wait <ожидание мс>, gpu <мс>,
-//! draws <N>, quads <N>, upload <МБ/с>, <ширина>x<высота>`.
+//! draws <N>, quads <N>, chunks <нарисовано>/<в поле зрения> (occluded <закрыто>), upload <МБ/с>,
+//! <ширина>x<высота>`.
 //! Так замеры можно сравнивать по файлу журнала, а не переписывать с экрана.
 
 use std::time::{Duration, Instant};
@@ -21,6 +22,9 @@ pub struct PerfLog {
     gpu_frames: u32,
     draws: u64,
     quads: u64,
+    drawn_chunks: u64,
+    in_frustum: u64,
+    occluded: u64,
     worst_frame_ms: f32,
     last_frame_at: Option<Instant>,
 }
@@ -37,6 +41,9 @@ impl PerfLog {
             gpu_frames: 0,
             draws: 0,
             quads: 0,
+            drawn_chunks: 0,
+            in_frustum: 0,
+            occluded: 0,
             worst_frame_ms: 0.0,
             last_frame_at: None,
         }
@@ -53,8 +60,11 @@ impl PerfLog {
         self.cpu_ms += frame.cpu_ms as f64;
         self.wait_ms += frame.wait_ms as f64;
         self.upload_bytes += frame.upload_bytes;
-        self.draws += frame.terrain_draws as u64;
-        self.quads += frame.terrain_quads;
+        self.draws += frame.cull.draws as u64;
+        self.quads += frame.cull.quads;
+        self.drawn_chunks += frame.cull.drawn_chunks as u64;
+        self.in_frustum += frame.cull.in_frustum as u64;
+        self.occluded += frame.cull.occluded as u64;
         if let Some(gpu) = frame.gpu_ms {
             self.gpu_ms += gpu as f64;
             self.gpu_frames += 1;
@@ -69,7 +79,7 @@ impl PerfLog {
                 "-".into()
             };
             log::info!(
-                "perf: {:.0} fps, frame {:.2} ms (worst {:.1} ms), cpu {:.2} ms, wait {:.2} ms, gpu {gpu} ms, draws {:.0}, quads {:.0}, upload {:.2} MB/s, {width}x{height}",
+                "perf: {:.0} fps, frame {:.2} ms (worst {:.1} ms), cpu {:.2} ms, wait {:.2} ms, gpu {gpu} ms, draws {:.0}, quads {:.0}, chunks {:.0}/{:.0} (occluded {:.0}), upload {:.2} MB/s, {width}x{height}",
                 frames / seconds,
                 seconds * 1000.0 / frames,
                 self.worst_frame_ms,
@@ -77,6 +87,9 @@ impl PerfLog {
                 self.wait_ms / frames,
                 self.draws as f64 / frames,
                 self.quads as f64 / frames,
+                self.drawn_chunks as f64 / frames,
+                self.in_frustum as f64 / frames,
+                self.occluded as f64 / frames,
                 self.upload_bytes as f64 / seconds / 1_048_576.0,
             );
             let last = self.last_frame_at;

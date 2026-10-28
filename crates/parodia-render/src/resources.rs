@@ -81,11 +81,41 @@ pub struct GpuImage {
 
 impl GpuImage {
     /// Картинка глубины (для правильного перекрытия: ближнее закрывает дальнее).
+    /// `sampled` — шейдеры могут читать её (нужно для пирамиды глубины Hi-Z).
     pub fn depth(
         device: &Device,
         allocator: &SharedAllocator,
         format: vk::Format,
         extent: vk::Extent2D,
+        sampled: bool,
+    ) -> Result<Self> {
+        let mut usage = vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        if sampled {
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
+        Self::new_2d(
+            device,
+            allocator,
+            format,
+            extent,
+            1,
+            usage,
+            vk::ImageAspectFlags::DEPTH,
+            "depth",
+        )
+    }
+
+    /// Двумерная картинка с `mip_levels` уровнями; `view` охватывает все уровни.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_2d(
+        device: &Device,
+        allocator: &SharedAllocator,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        mip_levels: u32,
+        usage: vk::ImageUsageFlags,
+        aspect: vk::ImageAspectFlags,
+        name: &str,
     ) -> Result<Self> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -95,11 +125,11 @@ impl GpuImage {
                 height: extent.height,
                 depth: 1,
             })
-            .mip_levels(1)
+            .mip_levels(mip_levels)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .usage(usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         // SAFETY: valid device and create info.
         let image = unsafe { device.create_image(&info, None) }?;
@@ -109,20 +139,26 @@ impl GpuImage {
             .lock()
             .map_err(|_| anyhow::anyhow!("GPU allocator mutex poisoned"))?
             .allocate(&AllocationCreateDesc {
-                name: "depth",
+                name,
                 requirements,
                 location: MemoryLocation::GpuOnly,
                 linear: false,
                 allocation_scheme: AllocationScheme::GpuAllocatorManaged,
             })
-            .context("out of GPU memory for depth buffer")?;
+            .with_context(|| format!("out of GPU memory for image '{name}'"))?;
         // SAFETY: memory satisfies the image's requirements.
         unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }?;
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
-            .subresource_range(depth_range());
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: 0,
+                level_count: mip_levels,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
         // SAFETY: image is bound to memory.
         let view = unsafe { device.create_image_view(&view_info, None) }?;
         Ok(Self {

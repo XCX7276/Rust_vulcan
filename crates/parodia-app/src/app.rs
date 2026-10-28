@@ -68,6 +68,8 @@ pub struct App {
     vsync: bool,
     validation: bool,
     face_culling: bool,
+    frustum_culling: bool,
+    occlusion_culling: bool,
     running: Option<Running>,
     fps: FpsCounter,
     last_frame: FrameStats,
@@ -88,8 +90,10 @@ impl App {
         let vsync = env_flags::flag("VSYNC", true);
         let validation = env_flags::flag("VALIDATION", cfg!(debug_assertions));
         let face_culling = env_flags::flag("FACE_CULLING", true);
+        let frustum_culling = env_flags::flag("FRUSTUM_CULLING", true);
+        let occlusion_culling = env_flags::flag("OCCLUSION_CULLING", true);
         log::info!(
-            "settings: lang={}, vsync={vsync}, validation={validation}, face_culling={face_culling}",
+            "settings: lang={}, vsync={vsync}, validation={validation}, face_culling={face_culling}, frustum_culling={frustum_culling}, occlusion_culling={occlusion_culling}",
             lang.code()
         );
         Ok(Self {
@@ -97,6 +101,8 @@ impl App {
             vsync,
             validation,
             face_culling,
+            frustum_culling,
+            occlusion_culling,
             running: None,
             fps: FpsCounter::new(),
             last_frame: FrameStats::default(),
@@ -132,6 +138,8 @@ impl App {
                 vsync: self.vsync,
                 validation: self.validation,
                 face_culling: self.face_culling,
+                frustum_culling: self.frustum_culling,
+                occlusion_culling: self.occlusion_culling,
                 width: size.width,
                 height: size.height,
             },
@@ -421,6 +429,7 @@ fn collect_debug_stats(
         _ => GpuKind::Other,
     };
     let terrain = renderer.terrain_stats();
+    let cull = renderer.cull_settings();
     let stream = world.streamer.stats();
     let position = world.camera.position;
     let block = BlockPos::new(
@@ -456,8 +465,14 @@ fn collect_debug_stats(
             chunk: [chunk.x, chunk.y, chunk.z],
             seed: world.seed,
             chunks: terrain.chunks,
-            draws: frame.terrain_draws,
-            quads: frame.terrain_quads,
+            draws: frame.cull.draws,
+            quads: frame.cull.quads,
+            in_frustum: frame.cull.in_frustum,
+            occluded: frame.cull.occluded,
+            drawn_chunks: frame.cull.drawn_chunks,
+            frustum_culling: cull.frustum,
+            occlusion_culling: cull.occlusion,
+            face_culling: cull.faces,
             pool_percent: if terrain.pool_capacity_quads > 0 {
                 terrain.pool_used_quads as f32 * 100.0 / terrain.pool_capacity_quads as f32
             } else {

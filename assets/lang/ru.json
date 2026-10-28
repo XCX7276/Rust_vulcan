@@ -22,11 +22,15 @@
   "debug.position": "Позиция: {x} {y} {z}",
   "debug.chunk": "Чанк: {x} {y} {z}",
   "debug.seed": "Зерно мира: {seed}",
-  "debug.terrain": "Ландшафт: чанков {chunks}, вызовов {draws}, квадов {quads}",
+  "debug.terrain": "Ландшафт: чанков с моделью {chunks}, вызовов {draws}, квадов {quads}",
   "debug.pool": "Пул геометрии занят: {percent}%",
   "hint.capture": "ЛКМ — управлять камерой, Esc — отпустить мышь",
   "hint.fly": "WASD — полёт, Пробел / Ctrl — вверх / вниз, Shift — быстрее",
   "debug.stream": "Мир: чанков в памяти {loaded}, с моделью {meshed}",
   "debug.jobs": "Задачи: генерация {generating}, модели {meshing}, в очереди {queued}, в видеопамять {uploads}, потоков {workers}",
-  "debug.job_time": "Время: генерация {generate} мс, модель {mesh} мс, стример {stream} мс/кадр, загрузка {upload} КБ/кадр"
+  "debug.job_time": "Время: генерация {generate} мс, модель {mesh} мс, стример {stream} мс/кадр, загрузка {upload} КБ/кадр",
+  "debug.culling": "Отсечение: в поле зрения {frustum}, закрыто {occluded}, нарисовано {drawn}",
+  "debug.culling_modes": "Отсечение: поле зрения {frustum}, Hi-Z {occlusion}, стороны граней {faces}",
+  "common.on": "вкл",
+  "common.off": "выкл"
 }

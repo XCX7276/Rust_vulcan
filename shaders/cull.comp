@@ -1,0 +1,211 @@
+#version 460
+// Chunk culling on the GPU. One thread per chunk slot.
+//
+// Steps for every live chunk:
+//   1. frustum test of the chunk box (all 8 corners outside one clip plane -> culled);
+//   2. pass 0 (early): draw chunks that were visible last frame;
+//      pass 1 (late): test the box against the Hi-Z depth pyramid built from the early pass,
+//      draw the chunks that became visible, and remember visibility for the next frame;
+//   3. face groups: quads are stored grouped by face direction; groups facing away from the
+//      camera are skipped, neighbouring visible groups are merged into one draw command.
+// Output: VkDrawIndirectCommand entries + counters (draw count and statistics).
+
+layout(local_size_x = 64) in;
+
+const uint FLAG_FRUSTUM = 1u;
+const uint FLAG_OCCLUSION = 2u;
+const uint FLAG_FACES = 4u;
+
+// Counter indices (must match culling.rs).
+const uint C_EARLY_DRAWS = 0u;
+const uint C_LATE_DRAWS = 1u;
+const uint C_IN_FRUSTUM = 2u;
+const uint C_OCCLUDED = 3u;
+const uint C_DRAWN_CHUNKS = 4u;
+const uint C_DRAWN_QUADS = 5u;
+const uint C_OVERFLOW = 6u;
+
+layout(push_constant) uniform Push {
+    mat4 view_proj;      // camera rotation + projection (camera at origin)
+    ivec4 camera_block;  // camera integer block position relative to the render origin
+    vec4 camera_frac;    // xyz: fractional part of camera position
+    uvec4 params;        // x: slot count, y: flags, z: pass (0 early, 1 late), w: max commands per list
+    vec4 pyramid;        // xy: pyramid mip 0 size, z: mip count
+} pc;
+
+struct ChunkRecord {
+    ivec4 origin;  // xyz: chunk corner relative to the render origin, w: 1 = live
+    uvec4 mesh;    // x: first quad in the pool, y/z/w: quad counts per face, 16 bits each
+};
+
+struct DrawCommand {
+    uint vertex_count;
+    uint instance_count;
+    uint first_vertex;
+    uint first_instance;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Chunks { ChunkRecord chunks[]; };
+layout(std430, set = 0, binding = 1) buffer Visibility { uint visible[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Draws { DrawCommand draws[]; };
+layout(std430, set = 0, binding = 3) buffer Counters { uint counters[]; };
+layout(set = 0, binding = 4) uniform sampler2D depth_pyramid;
+
+const float CHUNK = 32.0;
+
+// Clip-space corners of the box. Clip planes are linear, so the test is exact for boxes
+// behind the camera too (no division by w).
+bool outside_frustum(vec4 c[8]) {
+    uint left = 0u, right = 0u, bottom = 0u, top = 0u, in_front = 0u;
+    for (int i = 0; i < 8; i++) {
+        left += c[i].x < -c[i].w ? 1u : 0u;
+        right += c[i].x > c[i].w ? 1u : 0u;
+        bottom += c[i].y < -c[i].w ? 1u : 0u;
+        top += c[i].y > c[i].w ? 1u : 0u;
+        in_front += c[i].z > c[i].w ? 1u : 0u; // reverse-Z: depth > 1 is in front of the near plane
+    }
+    return left == 8u || right == 8u || bottom == 8u || top == 8u || in_front == 8u;
+}
+
+float pyramid_fetch(ivec2 texel, int level) {
+    return texelFetch(depth_pyramid, texel, level).r;
+}
+
+// Reverse-Z: larger depth = closer. The pyramid stores the farthest (smallest) depth of each area.
+// The box is hidden if even its closest point is farther than the farthest occluder in its area.
+bool occluded(vec4 c[8]) {
+    vec2 lo = vec2(1.0e9);
+    vec2 hi = vec2(-1.0e9);
+    float nearest = 0.0;
+    for (int i = 0; i < 8; i++) {
+        if (c[i].w <= 1.0e-4) {
+            return false; // box crosses the camera plane: treat as visible
+        }
+        vec3 ndc = c[i].xyz / c[i].w;
+        lo = min(lo, ndc.xy);
+        hi = max(hi, ndc.xy);
+        nearest = max(nearest, ndc.z);
+    }
+    if (nearest >= 1.0) {
+        return false;
+    }
+    vec2 uv_lo = clamp(lo * 0.5 + 0.5, 0.0, 1.0);
+    vec2 uv_hi = clamp(hi * 0.5 + 0.5, 0.0, 1.0);
+    vec2 size = (uv_hi - uv_lo) * pc.pyramid.xy;
+    int max_level = int(pc.pyramid.z) - 1;
+    // Level where the box covers at most one texel, so it touches at most 2x2 texels.
+    int level = clamp(int(ceil(log2(max(max(size.x, size.y), 1.0)))), 0, max_level);
+    ivec2 base = ivec2(pc.pyramid.xy);
+    ivec2 level_size = max(base >> level, ivec2(1));
+    ivec2 t0 = clamp(ivec2(uv_lo * vec2(level_size)), ivec2(0), level_size - 1);
+    ivec2 t1 = clamp(ivec2(uv_hi * vec2(level_size)), ivec2(0), level_size - 1);
+    if ((t1.x - t0.x > 1 || t1.y - t0.y > 1) && level < max_level) {
+        // Rounding pushed the box over 2 texels: one level up is always enough.
+        level += 1;
+        level_size = max(base >> level, ivec2(1));
+        t0 = clamp(ivec2(uv_lo * vec2(level_size)), ivec2(0), level_size - 1);
+        t1 = clamp(ivec2(uv_hi * vec2(level_size)), ivec2(0), level_size - 1);
+    }
+    float farthest = min(
+        min(pyramid_fetch(t0, level), pyramid_fetch(ivec2(t1.x, t0.y), level)),
+        min(pyramid_fetch(ivec2(t0.x, t1.y), level), pyramid_fetch(t1, level)));
+    return nearest < farthest;
+}
+
+void push_draw(uint list, uint counter, uint first_quad, uint quad_count, uint slot) {
+    uint index = atomicAdd(counters[counter], 1u);
+    if (index < pc.params.w) {
+        draws[list * pc.params.w + index] = DrawCommand(quad_count * 6u, 1u, first_quad * 6u, slot);
+    } else {
+        atomicAdd(counters[C_OVERFLOW], 1u);
+    }
+}
+
+// Emits draw commands for the face groups that can face the camera.
+void emit(uint slot, ChunkRecord chunk, vec3 box_min, uint list) {
+    uint counter = list == 0u ? C_EARLY_DRAWS : C_LATE_DRAWS;
+    uint counts[6] = uint[6](
+        chunk.mesh.y & 0xFFFFu, chunk.mesh.y >> 16,
+        chunk.mesh.z & 0xFFFFu, chunk.mesh.z >> 16,
+        chunk.mesh.w & 0xFFFFu, chunk.mesh.w >> 16);
+    // The camera is at the origin. A +X face at plane p faces the camera when p < 0; the lowest
+    // +X plane of the chunk is box_min.x + 1, so "box_min.x < 0" is a safe (slightly wider) test.
+    bool faces = (pc.params.y & FLAG_FACES) != 0u;
+    bool towards[6] = bool[6](
+        !faces || box_min.x < 0.0, !faces || box_min.x > -CHUNK,
+        !faces || box_min.y < 0.0, !faces || box_min.y > -CHUNK,
+        !faces || box_min.z < 0.0, !faces || box_min.z > -CHUNK);
+
+    uint offset = chunk.mesh.x;
+    uint run_start = offset;
+    uint run_count = 0u;
+    uint total = 0u;
+    for (int face = 0; face < 6; face++) {
+        uint count = counts[face];
+        if (towards[face]) {
+            run_count += count;
+            total += count;
+        } else {
+            if (run_count > 0u) {
+                push_draw(list, counter, run_start, run_count, slot);
+            }
+            run_start = offset + count;
+            run_count = 0u;
+        }
+        offset += count;
+    }
+    if (run_count > 0u) {
+        push_draw(list, counter, run_start, run_count, slot);
+    }
+    atomicAdd(counters[C_DRAWN_CHUNKS], 1u);
+    atomicAdd(counters[C_DRAWN_QUADS], total);
+}
+
+void main() {
+    uint slot = gl_GlobalInvocationID.x;
+    if (slot >= pc.params.x) {
+        return;
+    }
+    ChunkRecord chunk = chunks[slot];
+    if (chunk.origin.w == 0) {
+        return;
+    }
+    uint flags = pc.params.y;
+    bool late = pc.params.z == 1u;
+
+    // Integer math first (exact far from the world origin), float only for the small remainder.
+    vec3 box_min = vec3(chunk.origin.xyz - pc.camera_block.xyz) - pc.camera_frac.xyz;
+    vec4 corners[8];
+    for (int i = 0; i < 8; i++) {
+        vec3 corner = box_min + vec3(float(i & 1), float((i >> 1) & 1), float((i >> 2) & 1)) * CHUNK;
+        corners[i] = pc.view_proj * vec4(corner, 1.0);
+    }
+    bool in_frustum = (flags & FLAG_FRUSTUM) == 0u || !outside_frustum(corners);
+    bool occlusion = (flags & FLAG_OCCLUSION) != 0u;
+
+    if (!late) {
+        if (!in_frustum) {
+            return;
+        }
+        atomicAdd(counters[C_IN_FRUSTUM], 1u);
+        if (!occlusion || visible[slot] != 0u) {
+            emit(slot, chunk, box_min, 0u);
+        }
+        return;
+    }
+
+    // Late pass (only runs with occlusion culling on).
+    if (!in_frustum) {
+        visible[slot] = 0u;
+        return;
+    }
+    bool now_visible = !occluded(corners);
+    bool drawn_early = visible[slot] != 0u;
+    if (now_visible && !drawn_early) {
+        emit(slot, chunk, box_min, 1u);
+    }
+    if (!now_visible && !drawn_early) {
+        atomicAdd(counters[C_OCCLUDED], 1u);
+    }
+    visible[slot] = now_visible ? 1u : 0u;
+}

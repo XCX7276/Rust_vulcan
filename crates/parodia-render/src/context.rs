@@ -4,7 +4,8 @@
 //! 1. загружаем системную библиотеку Vulkan (`vulkan-1.dll`);
 //! 2. создаём экземпляр (instance) — «вход» в Vulkan; при отладке включаем слой проверки ошибок;
 //! 3. создаём поверхность (surface) — связь Vulkan с окном игры;
-//! 4. выбираем видеокарту, которая умеет Vulkan 1.3, динамический рендеринг и synchronization2;
+//! 4. выбираем видеокарту, которая умеет Vulkan 1.3, динамический рендеринг, synchronization2
+//!    и indirect-отрисовку многими командами за один вызов (её заполняет видеокарта при отсечении);
 //! 5. создаём логическое устройство (device) и берём очередь, куда будем отправлять команды.
 //!
 //! Всё это уничтожается в обратном порядке в `Drop`.
@@ -27,6 +28,11 @@ pub struct GpuInfo {
     /// Сколько наносекунд в одном «тике» счётчика времени видеокарты.
     pub timestamp_period_ns: f32,
     pub timestamps_supported: bool,
+    /// Видеокарта сама задаёт число команд отрисовки (`vkCmdDrawIndirectCount`).
+    /// Без этого рисуется полный список, а лишние команды пустые.
+    pub draw_indirect_count: bool,
+    /// Раздельные режимы (layouts) для глубины и трафарета.
+    pub separate_depth_stencil_layouts: bool,
 }
 
 pub struct GpuContext {
@@ -147,10 +153,22 @@ impl GpuContext {
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
+        // Раздельные режимы глубины (DEPTH_ATTACHMENT_OPTIMAL / DEPTH_READ_ONLY_OPTIMAL) включаем,
+        // если видеокарта их знает: буфер глубины то рисуется, то читается при построении пирамиды.
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .draw_indirect_count(info.draw_indirect_count)
+            .separate_depth_stencil_layouts(info.separate_depth_stencil_layouts);
+        let features10 = vk::PhysicalDeviceFeatures::default()
+            .multi_draw_indirect(true)
+            .draw_indirect_first_instance(true);
+        let mut features = vk::PhysicalDeviceFeatures2::default()
+            .features(features10)
+            .push_next(&mut features12)
+            .push_next(&mut features13);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_extensions)
-            .push_next(&mut features13);
+            .push_next(&mut features);
         // SAFETY: physical_device was checked to support everything requested above.
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .context("vkCreateDevice failed")?;
@@ -187,8 +205,8 @@ impl Drop for GpuContext {
     }
 }
 
-/// Выбирает видеокарту: нужна поддержка Vulkan 1.3, swapchain, dynamic rendering, synchronization2
-/// и очередь, которая умеет и рисовать, и показывать в окне.
+/// Выбирает видеокарту: нужна поддержка Vulkan 1.3, swapchain, dynamic rendering, synchronization2,
+/// multi-draw indirect с firstInstance и очередь, которая умеет и рисовать, и показывать в окне.
 /// Дискретная видеокарта предпочтительнее встроенной.
 fn pick_physical_device(
     instance: &Instance,
@@ -223,13 +241,25 @@ fn pick_physical_device(
         }
 
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features13);
-        // SAFETY: valid physical device; features2 chain points to a live struct.
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut features12)
+            .push_next(&mut features13);
+        // SAFETY: valid physical device; features2 chain points to live structs.
         unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+        let features10 = features2.features;
         if features13.dynamic_rendering == vk::FALSE || features13.synchronization2 == vk::FALSE {
             log::info!("skip GPU '{name}': no dynamic rendering / synchronization2");
             continue;
         }
+        if features10.multi_draw_indirect == vk::FALSE
+            || features10.draw_indirect_first_instance == vk::FALSE
+        {
+            log::info!("skip GPU '{name}': no multiDrawIndirect / drawIndirectFirstInstance");
+            continue;
+        }
+        let draw_indirect_count = features12.draw_indirect_count == vk::TRUE;
+        let separate_depth_stencil_layouts = features12.separate_depth_stencil_layouts == vk::TRUE;
 
         // SAFETY: valid physical device.
         let families =
@@ -277,6 +307,8 @@ fn pick_physical_device(
             timestamp_period_ns: props.limits.timestamp_period,
             timestamps_supported: props.limits.timestamp_compute_and_graphics == vk::TRUE
                 && timestamp_bits > 0,
+            draw_indirect_count,
+            separate_depth_stencil_layouts,
         };
 
         if best.as_ref().is_none_or(|(best_score, ..)| score > *best_score) {
@@ -286,7 +318,7 @@ fn pick_physical_device(
 
     match best {
         Some((_, physical_device, queue_family, info)) => Ok((physical_device, queue_family, info)),
-        None => bail!("no GPU with Vulkan 1.3 + dynamic rendering + synchronization2 found"),
+        None => bail!("no GPU with Vulkan 1.3 + dynamic rendering + synchronization2 + multi-draw indirect found"),
     }
 }
 

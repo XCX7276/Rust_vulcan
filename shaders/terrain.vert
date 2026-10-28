@@ -2,7 +2,7 @@
 // Terrain vertex shader (vertex pulling).
 // There is no vertex buffer: each quad is 2 uints in the shared geometry pool, and 6 vertices
 // (two triangles) are generated from it. gl_VertexIndex / 6 = quad, gl_VertexIndex % 6 = corner.
-// gl_InstanceIndex = chunk slot (passed as firstInstance), used to fetch the chunk origin.
+// gl_InstanceIndex = chunk slot (firstInstance of the indirect command written by cull.comp).
 
 layout(push_constant) uniform Push {
     mat4 view_proj;      // camera rotation + projection (camera at origin)
@@ -13,7 +13,12 @@ layout(push_constant) uniform Push {
 } pc;
 
 layout(std430, set = 0, binding = 0) readonly buffer Quads { uint quads[]; };
-layout(std430, set = 0, binding = 1) readonly buffer Chunks { ivec4 chunk_origin[]; };
+struct ChunkRecord {
+    ivec4 origin;  // xyz: chunk corner relative to the render origin, w: 1 = live
+    uvec4 mesh;    // x: first quad in the pool, y/z/w: quad counts per face (used by cull.comp)
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Chunks { ChunkRecord chunks[]; };
 layout(std430, set = 0, binding = 2) readonly buffer Colors { vec4 block_color[]; };
 
 layout(location = 0) out vec3 v_color;
@@ -52,7 +57,7 @@ void main() {
     ivec3 local = cell + plane + st.x * w * e1 + st.y * h * e2;
 
     // Integer math first (exact far from the world origin), float only for the small remainder.
-    ivec3 relative_block = chunk_origin[gl_InstanceIndex].xyz - pc.camera_block.xyz + local;
+    ivec3 relative_block = chunks[gl_InstanceIndex].origin.xyz - pc.camera_block.xyz + local;
     vec3 position = vec3(relative_block) - pc.camera_frac.xyz;
 
     gl_Position = pc.view_proj * vec4(position, 1.0);

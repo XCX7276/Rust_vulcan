@@ -1,7 +1,7 @@
 //! Экран отладки F3.
 //!
-//! Показывает цифры, по которым меряется скорость игры. На следующих этапах сюда добавятся
-//! позиция игрока, чанки (загружено / с мешем / в кадре / нарисовано), треугольники, очереди и память.
+//! Показывает цифры, по которым меряется скорость игры: время кадра, позицию, чанки
+//! (в памяти / с моделью / в поле зрения / закрыто / нарисовано), квады, очереди задач.
 
 use egui::{Align2, Color32, Frame, Id, Margin, RichText, vec2};
 
@@ -47,8 +47,17 @@ pub struct WorldDebug {
     pub chunk: [i64; 3],
     pub seed: u64,
     pub chunks: u32,
+    /// Команд отрисовки и квадов нарисовано (по данным видеокарты, с задержкой в пару кадров).
     pub draws: u32,
     pub quads: u64,
+    /// Отсечение: чанков в поле зрения, закрытых другими (не нарисованы), нарисовано.
+    pub in_frustum: u32,
+    pub occluded: u32,
+    pub drawn_chunks: u32,
+    /// Какие уровни отсечения включены.
+    pub frustum_culling: bool,
+    pub occlusion_culling: bool,
+    pub face_culling: bool,
     pub pool_percent: f32,
     /// Чанков в памяти (сгенерированных).
     pub loaded: usize,
@@ -131,6 +140,23 @@ pub fn debug_overlay(ctx: &egui::Context, lang: &Lang, stats: &DebugStats) {
                 ("chunks", &world.chunks),
                 ("draws", &world.draws),
                 ("quads", &world.quads),
+            ],
+        ));
+        lines.push(lang.fmt(
+            "debug.culling",
+            &[
+                ("frustum", &world.in_frustum),
+                ("occluded", &world.occluded),
+                ("drawn", &world.drawn_chunks),
+            ],
+        ));
+        let on_off = |on: bool| lang.tr(if on { "common.on" } else { "common.off" }).to_string();
+        lines.push(lang.fmt(
+            "debug.culling_modes",
+            &[
+                ("frustum", &on_off(world.frustum_culling)),
+                ("occlusion", &on_off(world.occlusion_culling)),
+                ("faces", &on_off(world.face_culling)),
             ],
         ));
         lines.push(lang.fmt(

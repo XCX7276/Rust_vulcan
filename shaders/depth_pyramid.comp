@@ -1,0 +1,33 @@
+#version 460
+// Builds one level of the Hi-Z depth pyramid.
+// Level 0 is read from the depth buffer (any size), the next levels from the previous level
+// (each source is a single-level view, so the shader always reads its level 0).
+// Every texel keeps the FARTHEST depth of the area it covers (reverse-Z: the smallest value),
+// so "the box is closer than the pyramid says" is a safe visibility test.
+// The source area is rounded outwards, so odd and non power-of-two sizes stay conservative.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Push {
+    ivec2 src_size;
+    ivec2 dst_size;
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.dst_size.x || p.y >= pc.dst_size.y) {
+        return;
+    }
+    ivec2 lo = (p * pc.src_size) / pc.dst_size;
+    ivec2 hi = min(((p + 1) * pc.src_size + pc.dst_size - 1) / pc.dst_size, pc.src_size);
+    float farthest = 1.0;
+    for (int y = lo.y; y < hi.y; y++) {
+        for (int x = lo.x; x < hi.x; x++) {
+            farthest = min(farthest, texelFetch(src, ivec2(x, y), 0).r);
+        }
+    }
+    imageStore(dst, p, vec4(farthest));
+}

@@ -22,11 +22,15 @@
   "debug.position": "Position: {x} {y} {z}",
   "debug.chunk": "Chunk: {x} {y} {z}",
   "debug.seed": "World seed: {seed}",
-  "debug.terrain": "Terrain: {chunks} chunks, {draws} draws, {quads} quads",
+  "debug.terrain": "Terrain: {chunks} chunks with mesh, {draws} draws, {quads} quads",
   "debug.pool": "Geometry pool used: {percent}%",
   "hint.capture": "LMB — control camera, Esc — release mouse",
   "hint.fly": "WASD — fly, Space / Ctrl — up / down, Shift — faster",
   "debug.stream": "World: {loaded} chunks in memory, {meshed} with mesh",
   "debug.jobs": "Jobs: generating {generating}, meshing {meshing}, queued {queued}, to GPU {uploads}, {workers} threads",
-  "debug.job_time": "Time: generate {generate} ms, mesh {mesh} ms, streamer {stream} ms/frame, upload {upload} KB/frame"
+  "debug.job_time": "Time: generate {generate} ms, mesh {mesh} ms, streamer {stream} ms/frame, upload {upload} KB/frame",
+  "debug.culling": "Culling: {frustum} in view, {occluded} occluded, {drawn} drawn",
+  "debug.culling_modes": "Culling: frustum {frustum}, Hi-Z {occlusion}, face groups {faces}",
+  "common.on": "on",
+  "common.off": "off"
 }

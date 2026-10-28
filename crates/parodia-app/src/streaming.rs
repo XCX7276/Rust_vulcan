@@ -26,7 +26,7 @@ use std::time::Instant;
 use anyhow::Result;
 use glam::{DVec3, Vec3};
 use parodia_core::jobs::WorkerPool;
-use parodia_mesh::{Mesher, Neighborhood};
+use parodia_mesh::{FaceCounts, Mesher, Neighborhood};
 use parodia_render::{ChunkMeshId, ChunkUpload, Renderer};
 use parodia_world::coords::{CHUNK_MAX_Y, CHUNK_MIN_Y, CHUNK_SHIFT, CHUNK_SIZE};
 use parodia_world::{BlockPos, BlockRegistry, Chunk, ChunkPos, TerrainGenerator};
@@ -74,6 +74,7 @@ enum JobOutput {
         pos: ChunkPos,
         version: u32,
         quads: Vec<u32>,
+        faces: FaceCounts,
         micros: u64,
     },
 }
@@ -241,6 +242,7 @@ impl TerrainStreamer {
                     pos,
                     version,
                     quads,
+                    faces,
                     micros,
                 } => {
                     add_time(&mut self.mesh_time, micros);
@@ -256,7 +258,7 @@ impl TerrainStreamer {
                         (origin.y - self.render_origin.y) as i32,
                         (origin.z - self.render_origin.z) as i32,
                     ];
-                    *mesh = match renderer.upload_chunk(relative, quads) {
+                    *mesh = match renderer.upload_chunk(relative, quads, faces.0) {
                         ChunkUpload::Queued(id) => Mesh::Built(Some(id)),
                         ChunkUpload::Empty => Mesh::Built(None),
                         ChunkUpload::PoolFull => {
@@ -444,11 +446,12 @@ impl TerrainStreamer {
                         neighbors: neighbors.each_ref().map(|n| n.as_deref()),
                     };
                     let mut quads = Vec::new();
-                    state.mesher.mesh(&neighborhood, &occludes, &mut quads);
+                    let faces = state.mesher.mesh(&neighborhood, &occludes, &mut quads);
                     JobOutput::Meshed {
                         pos,
                         version,
                         quads,
+                        faces,
                         micros: started.elapsed().as_micros() as u64,
                     }
                 });
