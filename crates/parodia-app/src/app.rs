@@ -12,7 +12,9 @@
 //! - `PARODIA_RADIUS=<чанков>` — радиус загрузки мира по горизонтали (по умолчанию 8);
 //! - `PARODIA_VRADIUS=<чанков>` — окно загрузки по высоте вокруг камеры (по умолчанию 4);
 //! - `PARODIA_WORKERS=<число>` — рабочих потоков генерации и мешинга (по умолчанию ядра − 2, не больше 6);
-//! - `PARODIA_FACE_CULLING=0` — рисовать и задние грани (для отладки).
+//! - `PARODIA_LOD_LEVELS=<0–4>` — уровней упрощённого дальнего мира (по умолчанию 4; 0 — без LOD);
+//! - `PARODIA_FACE_CULLING=0`, `PARODIA_FRUSTUM_CULLING=0`, `PARODIA_OCCLUSION_CULLING=0` —
+//!   выключить уровни отсечения (для замеров «до/после»).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -34,6 +36,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera::FlyCamera;
+use crate::lod::MAX_LOD_LEVELS;
 use crate::perf_log::PerfLog;
 use crate::streaming::{StreamConfig, TerrainStreamer};
 
@@ -47,8 +50,8 @@ struct WorldView {
     seed: u64,
     /// Точка отсчёта рендера: координаты чанков для видеокарты считаются от неё (в 32-битных числах).
     render_origin: BlockPos,
-    /// Радиус загрузки в блоках (для тумана).
-    radius_blocks: f32,
+    /// Дальность обзора в блоках (для тумана).
+    view_distance: f32,
     camera: FlyCamera,
     streamer: TerrainStreamer,
 }
@@ -235,7 +238,7 @@ impl App {
                 (block[2] - origin.z) as i32,
             ],
             camera_frac: frac,
-            fog_distance: run.world.radius_blocks,
+            fog_distance: run.world.view_distance,
             sun_dir: SUN_DIRECTION,
             sky_color: SKY_COLOR,
         };
@@ -305,6 +308,7 @@ fn load_world(renderer: &mut Renderer) -> Result<WorldView> {
         radius: number("RADIUS", 8, 1, 48),
         vertical_radius: number("VRADIUS", 4, 1, 32),
         workers: number("WORKERS", default_worker_count() as i64, 1, 32) as usize,
+        lod_levels: number("LOD_LEVELS", MAX_LOD_LEVELS as i64, 0, MAX_LOD_LEVELS as i64) as u32,
     };
     let generator = TerrainGenerator::new(seed, &registry)?;
 
@@ -315,12 +319,13 @@ fn load_world(renderer: &mut Renderer) -> Result<WorldView> {
     let render_origin = ChunkPos::new(center.x, 0, center.z).origin();
     log::info!("world: seed {seed}");
 
+    let streamer = TerrainStreamer::new(generator, &registry, config, render_origin)?;
     Ok(WorldView {
         seed,
         render_origin,
-        radius_blocks: (config.radius * 32) as f32,
+        view_distance: streamer.view_distance() as f32,
         camera: FlyCamera::new(DVec3::new(spawn_x as f64 + 0.5, spawn_height, spawn_z as f64 + 0.5)),
-        streamer: TerrainStreamer::new(generator, &registry, config, render_origin)?,
+        streamer,
     })
 }
 
@@ -489,6 +494,11 @@ fn collect_debug_stats(
             mesh_ms: stream.mesh_ms,
             stream_ms,
             upload_kb: frame.upload_bytes as f32 / 1024.0,
+            lod_shown: stream.lod_shown,
+            lod_pending: stream.lod_pending,
+            lod_ms: stream.lod_ms,
+            gated_columns: stream.gated_columns,
+            view_distance: world.view_distance,
         }),
         mouse_captured,
     }

@@ -32,5 +32,6 @@
   "debug.culling": "Culling: {frustum} in view, {occluded} occluded, {drawn} drawn",
   "debug.culling_modes": "Culling: frustum {frustum}, Hi-Z {occlusion}, face groups {faces}",
   "common.on": "on",
-  "common.off": "off"
+  "common.off": "off",
+  "debug.lod": "LOD: nodes 2 m {l1}, 4 m {l2}, 8 m {l3}, 16 m {l4}; building {pending} ({ms} ms), waiting chunk columns {gated}; view {distance} m"
 }

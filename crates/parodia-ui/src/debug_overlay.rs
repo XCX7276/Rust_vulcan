@@ -78,6 +78,16 @@ pub struct WorldDebug {
     pub stream_ms: f32,
     /// Скопировано в видеопамять за кадр (КБ).
     pub upload_kb: f32,
+    /// Узлов LOD на экране по уровням (индекс = уровень, 1–4).
+    pub lod_shown: [usize; 5],
+    /// Узлов LOD строится или ждёт показа.
+    pub lod_pending: usize,
+    /// Среднее время построения узла LOD (мс).
+    pub lod_ms: f32,
+    /// Столбцов полных чанков, ждущих показа.
+    pub gated_columns: usize,
+    /// Дальность обзора (блоков).
+    pub view_distance: f32,
 }
 
 /// Рисует экран F3 в левом верхнем углу.
@@ -175,6 +185,20 @@ pub fn debug_overlay(ctx: &egui::Context, lang: &Lang, stats: &DebugStats) {
                 ("queued", &world.queued_jobs),
                 ("uploads", &world.pending_uploads),
                 ("workers", &world.workers),
+            ],
+        ));
+        let [_, l1, l2, l3, l4] = world.lod_shown;
+        lines.push(lang.fmt(
+            "debug.lod",
+            &[
+                ("l1", &l1),
+                ("l2", &l2),
+                ("l3", &l3),
+                ("l4", &l4),
+                ("pending", &world.lod_pending),
+                ("gated", &world.gated_columns),
+                ("distance", &format!("{:.0}", world.view_distance)),
+                ("ms", &format!("{:.2}", world.lod_ms)),
             ],
         ));
         lines.push(lang.fmt(

@@ -32,5 +32,6 @@
   "debug.culling": "Отсечение: в поле зрения {frustum}, закрыто {occluded}, нарисовано {drawn}",
   "debug.culling_modes": "Отсечение: поле зрения {frustum}, Hi-Z {occlusion}, стороны граней {faces}",
   "common.on": "вкл",
-  "common.off": "выкл"
+  "common.off": "выкл",
+  "debug.lod": "LOD: узлов 2 м {l1}, 4 м {l2}, 8 м {l3}, 16 м {l4}; строится {pending} ({ms} мс), ждут чанков {gated}; дальность {distance} м"
 }

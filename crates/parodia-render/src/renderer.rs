@@ -313,15 +313,17 @@ impl Renderer {
 
     /// Ставит меш чанка в очередь загрузки в видеопамять (без ожидания).
     /// `origin` — угол чанка относительно точки отсчёта рендера; `quads` — по 2 слова на квад,
-    /// группами по сторонам; `faces` — число квадов каждой стороны.
+    /// группами по сторонам; `faces` — число квадов каждой стороны; `lod_level` — 0 для обычного
+    /// чанка, L для узла LOD (клетка = 2^L блоков).
     pub fn upload_chunk(
         &mut self,
         origin: [i32; 3],
         quads: Vec<u32>,
         faces: [u32; 6],
+        lod_level: u32,
     ) -> ChunkUpload {
         match self.terrain.as_mut() {
-            Some(terrain) => terrain.queue_upload(origin, quads, faces),
+            Some(terrain) => terrain.queue_upload(origin, quads, faces, lod_level),
             None => ChunkUpload::PoolFull,
         }
     }
@@ -587,8 +589,14 @@ impl Renderer {
                 scene.camera_frac[2],
                 scene.fog_distance,
             ],
-            sun_dir: [scene.sun_dir[0], scene.sun_dir[1], scene.sun_dir[2], 0.0],
-            fog_color: [scene.sky_color[0], scene.sky_color[1], scene.sky_color[2], 1.0],
+            // В `w` — размер картинки в пикселях: шейдер растягивает грани на полпикселя.
+            sun_dir: [scene.sun_dir[0], scene.sun_dir[1], scene.sun_dir[2], extent.width as f32],
+            fog_color: [
+                scene.sky_color[0],
+                scene.sky_color[1],
+                scene.sky_color[2],
+                extent.height as f32,
+            ],
         });
 
         // SAFETY: cmd is recording; all referenced objects are alive for this frame.
