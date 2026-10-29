@@ -64,6 +64,8 @@ pub struct StreamConfig {
     pub workers: usize,
     /// Уровней LOD (0 — без упрощённого дальнего мира).
     pub lod_levels: u32,
+    /// Затенение углов (AO) в моделях полных чанков.
+    pub ao: bool,
 }
 
 /// Рабочее состояние одного потока: свой построитель мешей со своими буферами.
@@ -842,6 +844,7 @@ impl TerrainStreamer {
                     *mesh = Mesh::Building(version);
                 }
                 let occludes = Arc::clone(&self.occludes);
+                let ao = self.config.ao;
                 self.pool.submit(priority, move |state: &mut WorkerState| {
                     let started = Instant::now();
                     let neighborhood = Neighborhood {
@@ -849,7 +852,7 @@ impl TerrainStreamer {
                         neighbors: neighbors.each_ref().map(|n| n.as_deref()),
                     };
                     let mut quads = Vec::new();
-                    let faces = state.mesher.mesh(&neighborhood, &occludes, &mut quads);
+                    let faces = state.mesher.mesh(&neighborhood, &occludes, ao, &mut quads);
                     JobOutput::Meshed {
                         pos,
                         version,
@@ -943,7 +946,7 @@ fn build_lod_node(
             ],
         };
         let mut quads = Vec::new();
-        let faces = mesher.mesh(&neighborhood, occludes, &mut quads);
+        let faces = mesher.mesh(&neighborhood, occludes, false, &mut quads);
         if faces.total() > 0 {
             meshes.push(LodMesh {
                 node_y: *node_y,

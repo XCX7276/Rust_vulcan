@@ -88,6 +88,16 @@ pub struct WorldDebug {
     pub gated_columns: usize,
     /// Дальность обзора (блоков).
     pub view_distance: f32,
+    /// Время суток (часы, 0–24) и ускорение хода времени (0 — пауза).
+    pub hours: f64,
+    pub time_speed: f64,
+    /// Склонение пути солнца и луны, градусы.
+    pub sun_tilt: f32,
+    /// Сетка карты теней: по рёбрам блоков (иначе — квадратная «с солнца»).
+    pub shadow_grid_blocks: bool,
+    /// Каскадов теней перерисовано в этом кадре и квадов в них.
+    pub shadow_cascades: u32,
+    pub shadow_quads: u64,
 }
 
 /// Рисует экран F3 в левом верхнем углу.
@@ -187,6 +197,30 @@ pub fn debug_overlay(ctx: &egui::Context, lang: &Lang, stats: &DebugStats) {
                 ("workers", &world.workers),
             ],
         ));
+        let minutes = (world.hours * 60.0).floor() as u32 % (24 * 60);
+        let speed = if world.time_speed == 0.0 {
+            lang.tr("debug.time_paused").to_string()
+        } else {
+            format!("×{}", world.time_speed)
+        };
+        lines.push(lang.fmt(
+            "debug.light",
+            &[
+                ("time", &format!("{:02}:{:02}", minutes / 60, minutes % 60)),
+                ("speed", &speed),
+                ("tilt", &format!("{:.0}", world.sun_tilt)),
+                (
+                    "grid",
+                    &lang.tr(if world.shadow_grid_blocks {
+                        "debug.shadow_grid.blocks"
+                    } else {
+                        "debug.shadow_grid.sun"
+                    }),
+                ),
+                ("cascades", &world.shadow_cascades),
+                ("quads", &world.shadow_quads),
+            ],
+        ));
         let [_, l1, l2, l3, l4] = world.lod_shown;
         lines.push(lang.fmt(
             "debug.lod",
@@ -215,6 +249,7 @@ pub fn debug_overlay(ctx: &egui::Context, lang: &Lang, stats: &DebugStats) {
         lines.push(String::new());
         lines.push(lang.tr("hint.capture").to_string());
         lines.push(lang.tr("hint.fly").to_string());
+        lines.push(lang.tr("hint.time").to_string());
     }
 
     egui::Area::new(Id::new("parodia_debug_overlay"))

@@ -1638,8 +1638,10 @@ dependencies = [
  "bytemuck",
  "egui",
  "egui-ash-renderer",
+ "glam",
  "gpu-allocator",
  "log",
+ "parodia-core",
  "raw-window-handle",
 ]
 

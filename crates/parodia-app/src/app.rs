@@ -14,7 +14,16 @@
 //! - `PARODIA_WORKERS=<число>` — рабочих потоков генерации и мешинга (по умолчанию ядра − 2, не больше 6);
 //! - `PARODIA_LOD_LEVELS=<0–4>` — уровней упрощённого дальнего мира (по умолчанию 4; 0 — без LOD);
 //! - `PARODIA_FACE_CULLING=0`, `PARODIA_FRUSTUM_CULLING=0`, `PARODIA_OCCLUSION_CULLING=0` —
-//!   выключить уровни отсечения (для замеров «до/после»).
+//!   выключить уровни отсечения (для замеров «до/после»);
+//! - `PARODIA_SHADOWS=0` — без теней; `PARODIA_SHADOW_SIZE=<256–8192>` — размер карты каскада (2048);
+//! - `PARODIA_SHADOW_GRID=sun` — прежняя квадратная карта теней (по умолчанию `blocks` — оси карты
+//!   по рёбрам блоков, края теней прямые при любом склонении; на ходу — клавиша G);
+//! - `PARODIA_AO=0` — без затенения углов;
+//! - `PARODIA_SUN_SIZE`, `PARODIA_MOON_SIZE=<градусы>` — размер солнца и луны на небе (по умолчанию 2.5);
+//! - `PARODIA_TIME=<часы>` — время суток при запуске (по умолчанию 9, можно дробное: 18.5);
+//! - `PARODIA_DAY_MINUTES=<минуты>` — длина суток в реальных минутах (по умолчанию 20; 0 — время стоит);
+//! - `PARODIA_SUN_TILT=<градусы 0–60>` — склонение пути солнца и луны (по умолчанию 0: через зенит,
+//!   тени параллельны граням блоков; с наклоном тени от вертикальных рёбер идут наискосок).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -22,10 +31,11 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use glam::DVec3;
+use parodia_core::daytime::DayClock;
 use parodia_core::env_flags;
 use parodia_core::frame_timer::FpsCounter;
 use parodia_core::jobs::default_worker_count;
-use parodia_render::{FrameStats, Renderer, RendererConfig, SceneView, UiFrame, vk};
+use parodia_render::{FrameStats, Renderer, RendererConfig, SceneView, ShadowGrid, UiFrame, vk};
 use parodia_ui::{DebugStats, GpuKind, Lang, WorldDebug};
 use parodia_world::{BlockPos, BlockRegistry, ChunkPos, TerrainGenerator};
 use winit::application::ApplicationHandler;
@@ -40,10 +50,11 @@ use crate::lod::MAX_LOD_LEVELS;
 use crate::perf_log::PerfLog;
 use crate::streaming::{StreamConfig, TerrainStreamer};
 
-/// Направление на солнце (пока неподвижное; смена суток — этап 7).
-const SUN_DIRECTION: [f32; 3] = [0.38, 0.85, 0.36];
-/// Цвет неба и тумана (линейный).
-const SKY_COLOR: [f32; 3] = [0.30, 0.50, 0.80];
+
+/// На сколько часов сдвигают время клавиши [ и ].
+const TIME_STEP_HOURS: f64 = 0.25;
+/// На сколько градусов меняют склонение пути солнца клавиши ; и '.
+const TILT_STEP_DEGREES: f32 = 5.0;
 
 /// Мир, загруженный для этого окна.
 struct WorldView {
@@ -54,6 +65,7 @@ struct WorldView {
     view_distance: f32,
     camera: FlyCamera,
     streamer: TerrainStreamer,
+    clock: DayClock,
 }
 
 /// Всё, что существует, пока открыто окно.
@@ -73,6 +85,12 @@ pub struct App {
     face_culling: bool,
     frustum_culling: bool,
     occlusion_culling: bool,
+    shadows: bool,
+    shadow_size: u32,
+    shadow_grid: ShadowGrid,
+    ao: bool,
+    sun_size: f32,
+    moon_size: f32,
     running: Option<Running>,
     fps: FpsCounter,
     last_frame: FrameStats,
@@ -95,9 +113,26 @@ impl App {
         let face_culling = env_flags::flag("FACE_CULLING", true);
         let frustum_culling = env_flags::flag("FRUSTUM_CULLING", true);
         let occlusion_culling = env_flags::flag("OCCLUSION_CULLING", true);
+        let shadows = env_flags::flag("SHADOWS", true);
+        let shadow_size = env_flags::text("SHADOW_SIZE")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(2048)
+            .clamp(256, 8192);
+        let shadow_grid = ShadowGrid::from_flag(env_flags::text("SHADOW_GRID").as_deref());
+        let ao = env_flags::flag("AO", true);
+        let degrees = |name: &str| {
+            env_flags::text(name)
+                .and_then(|s| s.replace(',', ".").parse::<f32>().ok())
+                .filter(|v| v.is_finite())
+                .unwrap_or(2.5)
+                .clamp(0.2, 20.0)
+        };
+        let sun_size = degrees("SUN_SIZE");
+        let moon_size = degrees("MOON_SIZE");
         log::info!(
-            "settings: lang={}, vsync={vsync}, validation={validation}, face_culling={face_culling}, frustum_culling={frustum_culling}, occlusion_culling={occlusion_culling}",
-            lang.code()
+            "settings: lang={}, vsync={vsync}, validation={validation}, face_culling={face_culling}, frustum_culling={frustum_culling}, occlusion_culling={occlusion_culling}, shadows={shadows}, shadow_size={shadow_size}, shadow_grid={}, ao={ao}, sun_size={sun_size}, moon_size={moon_size}",
+            lang.code(),
+            shadow_grid.name()
         );
         Ok(Self {
             lang,
@@ -106,6 +141,12 @@ impl App {
             face_culling,
             frustum_culling,
             occlusion_culling,
+            shadows,
+            shadow_size,
+            shadow_grid,
+            ao,
+            sun_size,
+            moon_size,
             running: None,
             fps: FpsCounter::new(),
             last_frame: FrameStats::default(),
@@ -143,12 +184,18 @@ impl App {
                 face_culling: self.face_culling,
                 frustum_culling: self.frustum_culling,
                 occlusion_culling: self.occlusion_culling,
+                shadows: self.shadows,
+                shadow_size: self.shadow_size,
+                shadow_grid: self.shadow_grid,
+                ao: self.ao,
+                sun_size: self.sun_size,
+                moon_size: self.moon_size,
                 width: size.width,
                 height: size.height,
             },
         )?;
 
-        let world = load_world(&mut renderer)?;
+        let world = load_world(&mut renderer, self.ao)?;
 
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -213,6 +260,7 @@ impl App {
         if self.mouse_captured {
             run.world.camera.update(dt, &self.keys);
         }
+        run.world.clock.advance(dt);
         let stream_started = Instant::now();
         run.world.streamer.update(
             &mut run.renderer,
@@ -230,6 +278,8 @@ impl App {
         let camera = &run.world.camera;
         let (block, frac) = camera.split_position();
         let origin = run.world.render_origin;
+        let origin_world = DVec3::new(origin.x as f64, origin.y as f64, origin.z as f64);
+        let relative = camera.position - origin_world;
         let scene = SceneView {
             view_proj: camera.view_proj(aspect).to_cols_array(),
             camera_block: [
@@ -238,9 +288,13 @@ impl App {
                 (block[2] - origin.z) as i32,
             ],
             camera_frac: frac,
-            fog_distance: run.world.view_distance,
-            sun_dir: SUN_DIRECTION,
-            sky_color: SKY_COLOR,
+            camera_position: relative.to_array(),
+            camera_height: camera.position.y,
+            forward: camera.forward().to_array(),
+            fov_y: camera.fov_y_degrees.to_radians(),
+            aspect,
+            view_distance: run.world.view_distance,
+            daylight: run.world.clock.daylight(),
         };
 
         let stats = collect_debug_stats(
@@ -283,7 +337,7 @@ impl App {
 
 /// Создаёт мир: реестр блоков, генератор, стример чанков, камера в точке появления.
 /// Сам ландшафт подгружается в фоне, начиная с первого кадра.
-fn load_world(renderer: &mut Renderer) -> Result<WorldView> {
+fn load_world(renderer: &mut Renderer, ao: bool) -> Result<WorldView> {
     let registry = BlockRegistry::builtin()?;
     // Цвета из файла — в sRGB; шейдер работает в линейном цвете.
     let colors: Vec<[f32; 4]> = registry
@@ -309,7 +363,22 @@ fn load_world(renderer: &mut Renderer) -> Result<WorldView> {
         vertical_radius: number("VRADIUS", 4, 1, 32),
         workers: number("WORKERS", default_worker_count() as i64, 1, 32) as usize,
         lod_levels: number("LOD_LEVELS", MAX_LOD_LEVELS as i64, 0, MAX_LOD_LEVELS as i64) as u32,
+        ao,
     };
+    let hours_flag = |name: &str, default: f64| {
+        env_flags::text(name)
+            .and_then(|s| s.replace(',', ".").parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(default)
+    };
+    let (start, day_minutes, tilt) = (
+        hours_flag("TIME", 9.0),
+        hours_flag("DAY_MINUTES", 20.0).max(0.0),
+        hours_flag("SUN_TILT", 0.0),
+    );
+    let mut clock = DayClock::new(start, day_minutes);
+    clock.set_tilt_degrees(tilt as f32);
+    log::info!("time: start {start} h, day {day_minutes} min, sun tilt {tilt}°");
     let generator = TerrainGenerator::new(seed, &registry)?;
 
     let spawn_x = 0i64;
@@ -326,6 +395,7 @@ fn load_world(renderer: &mut Renderer) -> Result<WorldView> {
         view_distance: streamer.view_distance() as f32,
         camera: FlyCamera::new(DVec3::new(spawn_x as f64 + 0.5, spawn_height, spawn_z as f64 + 0.5)),
         streamer,
+        clock,
     })
 }
 
@@ -370,6 +440,26 @@ impl ApplicationHandler for App {
             } => match state {
                 ElementState::Pressed => {
                     self.keys.insert(code);
+                    // Время суток (для проверки света): [ ] — назад / вперёд (можно держать),
+                    // − / = — медленнее / быстрее, P — пауза, ; ' — склонение пути солнца − / +.
+                    if let Some(run) = self.running.as_mut() {
+                        let clock = &mut run.world.clock;
+                        match code {
+                            KeyCode::BracketLeft => clock.shift(-TIME_STEP_HOURS),
+                            KeyCode::BracketRight => clock.shift(TIME_STEP_HOURS),
+                            KeyCode::Minus if !repeat => clock.change_speed(false),
+                            KeyCode::Equal if !repeat => clock.change_speed(true),
+                            KeyCode::KeyP if !repeat => clock.toggle_pause(),
+                            KeyCode::Semicolon => clock.change_tilt(-TILT_STEP_DEGREES),
+                            KeyCode::Quote => clock.change_tilt(TILT_STEP_DEGREES),
+                            // G — сравнить варианты сетки карты теней.
+                            KeyCode::KeyG if !repeat => {
+                                let grid = run.renderer.shadow_grid().toggled();
+                                run.renderer.set_shadow_grid(grid);
+                            }
+                            _ => {}
+                        }
+                    }
                     if !repeat {
                         match code {
                             KeyCode::F3 => self.show_debug = !self.show_debug,
@@ -499,6 +589,12 @@ fn collect_debug_stats(
             lod_ms: stream.lod_ms,
             gated_columns: stream.gated_columns,
             view_distance: world.view_distance,
+            hours: world.clock.hours(),
+            time_speed: world.clock.speed(),
+            sun_tilt: world.clock.tilt_degrees(),
+            shadow_grid_blocks: renderer.shadow_grid() == ShadowGrid::Blocks,
+            shadow_cascades: frame.shadow_cascades,
+            shadow_quads: frame.cull.shadow_quads,
         }),
         mouse_captured,
     }

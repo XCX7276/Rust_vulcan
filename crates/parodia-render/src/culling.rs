@@ -19,6 +19,9 @@
 //!
 //! Результат — список команд indirect-отрисовки (`VkDrawIndirectCommand`) и их число;
 //! ландшафт рисуется одним вызовом `vkCmdDrawIndirectCount` на проход.
+//!
+//! Тот же шейдер готовит списки для 4 каскадов теней (`CullPass::Shadow`): чанки внутри коробки
+//! каскада, только стороны, повёрнутые к солнцу (остальные тень не отбрасывают), без Hi-Z.
 //! Счётчики (сколько в кадре, сколько закрыто, сколько нарисовано) копируются в память,
 //! которую читает процессор, и показываются в F3 с задержкой в пару кадров.
 
@@ -55,7 +58,12 @@ const C_OCCLUDED: usize = 3;
 const C_DRAWN_CHUNKS: usize = 4;
 const C_DRAWN_QUADS: usize = 5;
 const C_OVERFLOW: usize = 6;
-const COUNTERS: usize = 8;
+const C_SHADOW_QUADS: usize = 7;
+/// + номер каскада.
+const C_SHADOW_DRAWS: usize = 8;
+const COUNTERS: usize = 12;
+/// Списков команд: ранний, поздний и 4 каскада теней.
+const LISTS: u64 = 6;
 const COUNTER_BYTES: u64 = (COUNTERS * 4) as u64;
 
 const FLAG_FRUSTUM: u32 = 1;
@@ -83,15 +91,30 @@ pub struct CullStats {
     pub draws: u32,
     /// Квадов нарисовано.
     pub quads: u64,
+    /// Квадов нарисовано в каскады теней.
+    pub shadow_quads: u64,
 }
 
 /// Проход отсечения.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CullPass {
     /// Чанки, видимые в прошлом кадре.
-    Early = 0,
+    Early,
     /// Остальные: проверка по пирамиде глубины.
-    Late = 1,
+    Late,
+    /// Каскад теней 0–3.
+    Shadow(u32),
+}
+
+impl CullPass {
+    /// Номер прохода в шейдере = номер списка команд.
+    fn index(self) -> u32 {
+        match self {
+            CullPass::Early => 0,
+            CullPass::Late => 1,
+            CullPass::Shadow(cascade) => 2 + cascade,
+        }
+    }
 }
 
 /// Где лежат команды отрисовки одного прохода.
@@ -113,7 +136,7 @@ struct CullPush {
     camera_frac: [f32; 4],
     /// slot count, flags, pass, max commands per list
     params: [u32; 4],
-    /// pyramid width, height, mip count
+    /// early/late: pyramid width, height, mip count; shadow: direction to the light
     pyramid: [f32; 4],
 }
 
@@ -125,11 +148,13 @@ struct PyramidPush {
 }
 
 /// Камера для отсечения (те же данные, что получает шейдер ландшафта).
+/// Для каскада теней `view_proj` — матрица каскада, `light_dir` — направление на свет.
 #[derive(Clone, Copy, Debug)]
 pub struct CullView {
     pub view_proj: [f32; 16],
     pub camera_block: [i32; 3],
     pub camera_frac: [f32; 3],
+    pub light_dir: [f32; 3],
 }
 
 struct Pyramid {
@@ -194,7 +219,7 @@ impl Culling {
         let draws = GpuBuffer::new(
             device,
             allocator,
-            2 * MAX_DRAWS as u64 * DRAW_BYTES,
+            LISTS * MAX_DRAWS as u64 * DRAW_BYTES,
             indirect,
             MemoryLocation::GpuOnly,
             "terrain draw commands",
@@ -573,7 +598,7 @@ impl Culling {
                 // Без vkCmdDrawIndirectCount рисуется весь список: неиспользованные команды — пустые.
                 let bytes = (slot_limit.min(MAX_CHUNK_SLOTS) * DRAWS_PER_CHUNK) as u64 * DRAW_BYTES;
                 if bytes > 0 {
-                    for list in 0..2u64 {
+                    for list in 0..LISTS {
                         let offset = list * MAX_DRAWS as u64 * DRAW_BYTES;
                         device.cmd_fill_buffer(cmd, self.draws.buffer, offset, bytes, 0);
                     }
@@ -601,11 +626,12 @@ impl Culling {
         if slot_limit == 0 {
             return;
         }
+        let shadow = matches!(pass, CullPass::Shadow(_));
         let mut flags = 0;
         if self.settings.frustum {
             flags |= FLAG_FRUSTUM;
         }
-        if self.settings.occlusion {
+        if self.settings.occlusion && !shadow {
             flags |= FLAG_OCCLUSION;
         }
         if self.settings.faces {
@@ -615,13 +641,17 @@ impl Culling {
             view_proj: view.view_proj,
             camera_block: [view.camera_block[0], view.camera_block[1], view.camera_block[2], 0],
             camera_frac: [view.camera_frac[0], view.camera_frac[1], view.camera_frac[2], 0.0],
-            params: [slot_limit, flags, pass as u32, MAX_DRAWS],
-            pyramid: [
-                pyramid.width as f32,
-                pyramid.height as f32,
-                pyramid.levels as f32,
-                0.0,
-            ],
+            params: [slot_limit, flags, pass.index(), MAX_DRAWS],
+            pyramid: if shadow {
+                [view.light_dir[0], view.light_dir[1], view.light_dir[2], 0.0]
+            } else {
+                [
+                    pyramid.width as f32,
+                    pyramid.height as f32,
+                    pyramid.levels as f32,
+                    0.0,
+                ]
+            },
         };
         let done = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
@@ -778,6 +808,10 @@ impl Culling {
         let (offset, count) = match pass {
             CullPass::Early => (0, C_EARLY_DRAWS),
             CullPass::Late => (MAX_DRAWS as u64 * DRAW_BYTES, C_LATE_DRAWS),
+            CullPass::Shadow(cascade) => (
+                pass.index() as u64 * MAX_DRAWS as u64 * DRAW_BYTES,
+                C_SHADOW_DRAWS + cascade as usize,
+            ),
         };
         IndirectList {
             buffer: self.draws.buffer,
@@ -836,6 +870,7 @@ impl Culling {
             drawn_chunks: c[C_DRAWN_CHUNKS],
             draws: c[C_EARLY_DRAWS].min(MAX_DRAWS) + c[C_LATE_DRAWS].min(MAX_DRAWS),
             quads: c[C_DRAWN_QUADS] as u64,
+            shadow_quads: c[C_SHADOW_QUADS] as u64,
         })
     }
 

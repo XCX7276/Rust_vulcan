@@ -8,6 +8,9 @@
 //      draw the chunks that became visible, and remember visibility for the next frame;
 //   3. face groups: quads are stored grouped by face direction; groups facing away from the
 //      camera are skipped, neighbouring visible groups are merged into one draw command.
+// Passes 2..5 build the draw lists of the 4 shadow cascades: frustum test against the cascade
+// box, only the face groups turned AWAY from the light (back faces: a lit face can then never
+// shadow itself, so almost no depth bias is needed), no occlusion test.
 // Output: VkDrawIndirectCommand entries + counters (draw count and statistics).
 
 layout(local_size_x = 64) in;
@@ -24,13 +27,15 @@ const uint C_OCCLUDED = 3u;
 const uint C_DRAWN_CHUNKS = 4u;
 const uint C_DRAWN_QUADS = 5u;
 const uint C_OVERFLOW = 6u;
+const uint C_SHADOW_QUADS = 7u;
+const uint C_SHADOW_DRAWS = 8u; // + cascade
 
 layout(push_constant) uniform Push {
     mat4 view_proj;      // camera rotation + projection (camera at origin)
     ivec4 camera_block;  // camera integer block position relative to the render origin
     vec4 camera_frac;    // xyz: fractional part of camera position
-    uvec4 params;        // x: slot count, y: flags, z: pass (0 early, 1 late), w: max commands per list
-    vec4 pyramid;        // xy: pyramid mip 0 size, z: mip count
+    uvec4 params;        // x: slot count, y: flags, z: pass (0 early, 1 late, 2+i shadow cascade i), w: max commands per list
+    vec4 pyramid;        // early/late: xy pyramid mip 0 size, z mip count; shadow: xyz direction to the light
 } pc;
 
 struct ChunkRecord {
@@ -120,20 +125,13 @@ void push_draw(uint list, uint counter, uint first_quad, uint quad_count, uint s
     }
 }
 
-// Emits draw commands for the face groups that can face the camera.
-void emit(uint slot, ChunkRecord chunk, vec3 box_min, float box_size, uint list) {
-    uint counter = list == 0u ? C_EARLY_DRAWS : C_LATE_DRAWS;
+// Emits draw commands for the face groups marked in `towards`, merging neighbouring groups.
+void emit(uint slot, ChunkRecord chunk, bool towards[6], uint list) {
+    uint counter = list == 0u ? C_EARLY_DRAWS : (list == 1u ? C_LATE_DRAWS : C_SHADOW_DRAWS + list - 2u);
     uint counts[6] = uint[6](
         chunk.mesh.y & 0xFFFFu, chunk.mesh.y >> 16,
         chunk.mesh.z & 0xFFFFu, chunk.mesh.z >> 16,
         chunk.mesh.w & 0xFFFFu, chunk.mesh.w >> 16);
-    // The camera is at the origin. A +X face at plane p faces the camera when p < 0; the lowest
-    // +X plane of the chunk is box_min.x + cell, so "box_min.x < 0" is a safe (slightly wider) test.
-    bool faces = (pc.params.y & FLAG_FACES) != 0u;
-    bool towards[6] = bool[6](
-        !faces || box_min.x < 0.0, !faces || box_min.x > -box_size,
-        !faces || box_min.y < 0.0, !faces || box_min.y > -box_size,
-        !faces || box_min.z < 0.0, !faces || box_min.z > -box_size);
 
     uint offset = chunk.mesh.x;
     uint run_start = offset;
@@ -156,8 +154,23 @@ void emit(uint slot, ChunkRecord chunk, vec3 box_min, float box_size, uint list)
     if (run_count > 0u) {
         push_draw(list, counter, run_start, run_count, slot);
     }
-    atomicAdd(counters[C_DRAWN_CHUNKS], 1u);
-    atomicAdd(counters[C_DRAWN_QUADS], total);
+    if (list < 2u) {
+        atomicAdd(counters[C_DRAWN_CHUNKS], 1u);
+        atomicAdd(counters[C_DRAWN_QUADS], total);
+    } else {
+        atomicAdd(counters[C_SHADOW_QUADS], total);
+    }
+}
+
+// Face groups that can face the camera. The camera is at the origin. A +X face at plane p faces
+// the camera when p < 0; the lowest +X plane of the chunk is box_min.x + cell, so "box_min.x < 0"
+// is a safe (slightly wider) test.
+void groups_towards_camera(vec3 box_min, float box_size, out bool towards[6]) {
+    bool faces = (pc.params.y & FLAG_FACES) != 0u;
+    towards = bool[6](
+        !faces || box_min.x < 0.0, !faces || box_min.x > -box_size,
+        !faces || box_min.y < 0.0, !faces || box_min.y > -box_size,
+        !faces || box_min.z < 0.0, !faces || box_min.z > -box_size);
 }
 
 void main() {
@@ -182,14 +195,32 @@ void main() {
     }
     bool in_frustum = (flags & FLAG_FRUSTUM) == 0u || !outside_frustum(corners);
     bool occlusion = (flags & FLAG_OCCLUSION) != 0u;
+    uint pass = pc.params.z;
 
+    if (pass >= 2u) {
+        // Shadow cascade: faces turned away from the light (see the header).
+        if (!in_frustum) {
+            return;
+        }
+        vec3 l = pc.pyramid.xyz;
+        bool faces = (flags & FLAG_FACES) != 0u;
+        bool towards[6] = bool[6](
+            !faces || l.x < 0.0, !faces || l.x > 0.0,
+            !faces || l.y < 0.0, !faces || l.y > 0.0,
+            !faces || l.z < 0.0, !faces || l.z > 0.0);
+        emit(slot, chunk, towards, pass);
+        return;
+    }
+
+    bool towards[6];
+    groups_towards_camera(box_min, box_size, towards);
     if (!late) {
         if (!in_frustum) {
             return;
         }
         atomicAdd(counters[C_IN_FRUSTUM], 1u);
         if (!occlusion || visible[slot] != 0u) {
-            emit(slot, chunk, box_min, box_size, 0u);
+            emit(slot, chunk, towards, 0u);
         }
         return;
     }
@@ -202,7 +233,7 @@ void main() {
     bool now_visible = !occluded(corners);
     bool drawn_early = visible[slot] != 0u;
     if (now_visible && !drawn_early) {
-        emit(slot, chunk, box_min, box_size, 1u);
+        emit(slot, chunk, towards, 1u);
     }
     if (!now_visible && !drawn_early) {
         atomicAdd(counters[C_OCCLUDED], 1u);

@@ -33,5 +33,10 @@
   "debug.culling_modes": "Отсечение: поле зрения {frustum}, Hi-Z {occlusion}, стороны граней {faces}",
   "common.on": "вкл",
   "common.off": "выкл",
-  "debug.lod": "LOD: узлов 2 м {l1}, 4 м {l2}, 8 м {l3}, 16 м {l4}; строится {pending} ({ms} мс), ждут чанков {gated}; дальность {distance} м"
+  "debug.lod": "LOD: узлов 2 м {l1}, 4 м {l2}, 8 м {l3}, 16 м {l4}; строится {pending} ({ms} мс), ждут чанков {gated}; дальность {distance} м",
+  "debug.light": "Свет: время {time} ({speed}), склонение {tilt}°, сетка теней {grid}; каскадов теней перерисовано {cascades} из 4, квадов в тенях {quads}",
+  "debug.shadow_grid.blocks": "по блокам",
+  "debug.shadow_grid.sun": "с солнца",
+  "debug.time_paused": "пауза",
+  "hint.time": "[ / ] — время назад / вперёд, − / = — медленнее / быстрее, P — пауза, ; / ' — склонение солнца − / +, G — сетка теней"
 }

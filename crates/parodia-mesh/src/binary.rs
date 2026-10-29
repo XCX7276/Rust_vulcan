@@ -19,7 +19,7 @@ use parodia_world::BlockId;
 use parodia_world::chunk::Chunk;
 use parodia_world::coords::{CHUNK_VOLUME, LocalPos};
 
-use crate::{Face, FaceCounts, pack_quad};
+use crate::{AO_NONE, Face, FaceCounts, pack_quad, pack_quad_ao};
 
 const P: usize = 34; // сторона расширенного куба
 const P2: usize = P * P;
@@ -44,6 +44,8 @@ pub struct Mesher {
     columns: [Vec<u64>; 3],
     /// Плоскости по (грань, слой): 6 × 32 списков.
     planes: Vec<Vec<Plane>>,
+    /// Грани с затенением углов (не сливаются): готовые квады по сторонам.
+    ao_quads: [Vec<u32>; 6],
 }
 
 impl Default for Mesher {
@@ -63,16 +65,19 @@ impl Mesher {
             padded: vec![BlockId::AIR; P3],
             columns: [vec![0; P2], vec![0; P2], vec![0; P2]],
             planes: (0..6 * 32).map(|_| Vec::new()).collect(),
+            ao_quads: Default::default(),
         }
     }
 
     /// Строит квады чанка и дописывает их в `out` (по 2 слова u32 на квад), группами по сторонам.
     /// `occludes[id]` — закрывает ли блок с номером `id` грани соседей (непрозрачный ли).
+    /// `ao` — считать затенение углов (для узлов LOD не нужно).
     /// Возвращает число квадов каждой стороны.
     pub fn mesh(
         &mut self,
         n: &Neighborhood<'_>,
         occludes: &[bool],
+        ao: bool,
         out: &mut Vec<u32>,
     ) -> FaceCounts {
         if !may_have_faces(n, occludes) {
@@ -80,8 +85,47 @@ impl Mesher {
         }
         self.fill_padded(n);
         self.build_columns(occludes);
-        self.collect_faces(occludes);
+        self.collect_faces(occludes, ao);
         self.merge_planes(out)
+    }
+
+    /// Затенение 4 углов грани `face` клетки (x, y, z) расширенного куба; `AO_NONE` — углы открыты.
+    fn face_ao(&self, face: usize, x: usize, y: usize, z: usize, occludes: &[bool]) -> u8 {
+        let solid = |p: [usize; 3]| occludes[self.padded[pidx(p[0], p[1], p[2])].0 as usize];
+        let axis = face / 2;
+        let mut front = [x, y, z];
+        if face.is_multiple_of(2) {
+            front[axis] += 1;
+        } else {
+            front[axis] -= 1;
+        }
+        // Оси ширины и высоты грани — как в `pack_quad` и шейдере.
+        let (e1, e2) = match axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        let shift = |p: [usize; 3], axis: usize, positive: bool| {
+            let mut q = p;
+            q[axis] = if positive { q[axis] + 1 } else { q[axis] - 1 };
+            q
+        };
+        let mut ao = 0u8;
+        for (corner, (s, t)) in [(false, false), (true, false), (true, true), (false, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let side1 = solid(shift(front, e1, s));
+            let side2 = solid(shift(front, e2, t));
+            let diagonal = solid(shift(shift(front, e1, s), e2, t));
+            let light = if side1 && side2 {
+                0
+            } else {
+                3 - side1 as u8 - side2 as u8 - diagonal as u8
+            };
+            ao |= light << (corner * 2);
+        }
+        ao
     }
 
     fn fill_padded(&mut self, n: &Neighborhood<'_>) {
@@ -143,9 +187,12 @@ impl Mesher {
         }
     }
 
-    fn collect_faces(&mut self, occludes: &[bool]) {
+    fn collect_faces(&mut self, occludes: &[bool], ao: bool) {
         for planes in &mut self.planes {
             planes.clear();
+        }
+        for quads in &mut self.ao_quads {
+            quads.clear();
         }
         for axis in 0..3 {
             for b in 1..=32 {
@@ -168,6 +215,23 @@ impl Mesher {
                             };
                             let block = self.padded[pidx(x, y, z)];
                             debug_assert!(occludes[block.0 as usize]);
+                            if ao {
+                                let pattern = self.face_ao(face_index, x, y, z, occludes);
+                                if pattern != AO_NONE {
+                                    // Затенённая грань — отдельным квадратом 1×1.
+                                    self.ao_quads[face_index].extend_from_slice(&pack_quad_ao(
+                                        x as u32 - 1,
+                                        y as u32 - 1,
+                                        z as u32 - 1,
+                                        1,
+                                        1,
+                                        Face::ALL[face_index],
+                                        block.0,
+                                        pattern,
+                                    ));
+                                    continue;
+                                }
+                            }
                             let planes = &mut self.planes[face_index * 32 + layer];
                             let plane = match planes.iter_mut().position(|p| p.block == block) {
                                 Some(i) => &mut planes[i],
@@ -194,6 +258,12 @@ impl Mesher {
         for (index, planes) in self.planes.iter_mut().enumerate() {
             let face = Face::ALL[index / 32];
             let layer = (index % 32) as u32;
+            if index % 32 == 0 && index > 0 {
+                // Сторона закончилась — дописываем её затенённые квадраты (группа сторон не рвётся).
+                let previous = index / 32 - 1;
+                counts.0[previous] += (self.ao_quads[previous].len() / 2) as u32;
+                out.extend_from_slice(&self.ao_quads[previous]);
+            }
             for plane in planes.iter_mut() {
                 let rows = &mut plane.rows;
                 for row in 0..32 {
@@ -231,6 +301,8 @@ impl Mesher {
                 }
             }
         }
+        counts.0[5] += (self.ao_quads[5].len() / 2) as u32;
+        out.extend_from_slice(&self.ao_quads[5]);
         counts
     }
 }
@@ -259,8 +331,12 @@ mod tests {
     const OCCLUDES: [bool; 3] = [false, true, true];
 
     fn mesh(center: &Chunk, neighbors: [Option<&Chunk>; 6]) -> Vec<[u32; 2]> {
+        mesh_with(center, neighbors, false)
+    }
+
+    fn mesh_with(center: &Chunk, neighbors: [Option<&Chunk>; 6], ao: bool) -> Vec<[u32; 2]> {
         let mut out = Vec::new();
-        let counts = Mesher::new().mesh(&Neighborhood { center, neighbors }, &OCCLUDES, &mut out);
+        let counts = Mesher::new().mesh(&Neighborhood { center, neighbors }, &OCCLUDES, ao, &mut out);
         assert_eq!(out.len(), counts.total() as usize * 2);
         let quads: Vec<[u32; 2]> = out.chunks(2).map(|c| [c[0], c[1]]).collect();
         // Квады идут группами по сторонам, и размеры групп совпадают со счётчиками.
@@ -341,6 +417,38 @@ mod tests {
         assert_eq!(area[Face::NegY as usize], 0);
         assert_eq!(area[Face::PosY as usize], 1024);
         assert_eq!(quads.iter().filter(|q| unpack_quad(**q).5 == Face::PosY as u32).count(), 1);
+    }
+
+    #[test]
+    fn ao_darkens_floor_corners_next_to_wall() {
+        // Пол y = 0 и стена x = 10 высотой 2 блока.
+        let chunk = Chunk::from_fn(|p| {
+            if p.y == 0 || (p.x == 10 && p.y <= 2) { STONE } else { BlockId::AIR }
+        });
+        let quads = mesh_with(&chunk, [None; 6], true);
+        let floor_at = |x: u32, z: u32| {
+            quads
+                .iter()
+                .find(|q| {
+                    let (qx, qy, qz, w, h, face, _) = unpack_quad(**q);
+                    face == Face::PosY as u32 && qy == 0 && x >= qx && x < qx + w && z >= qz && z < qz + h
+                })
+                .copied()
+                .expect("floor quad")
+        };
+        // Клетка пола у стены (x = 9): углы со стороны стены (s = 1) затенены (стена сбоку и по диагонали),
+        // дальние открыты.
+        let near = floor_at(9, 5);
+        assert_eq!(unpack_quad(near).3, 1, "shaded faces are not merged");
+        let ao = crate::quad_ao(near);
+        let light = |corner: u8| (ao >> (corner * 2)) & 3;
+        assert_eq!((light(0), light(1), light(2), light(3)), (3, 1, 1, 3));
+        // Далеко от стены — обычный слитый квад без затенения.
+        let far = floor_at(3, 5);
+        assert_eq!(crate::quad_ao(far), crate::AO_NONE);
+        assert!(unpack_quad(far).3 > 1);
+        // Площадь граней с AO и без AO одинакова.
+        assert_eq!(area_per_face(&quads), area_per_face(&mesh(&chunk, [None; 6])));
     }
 
     #[test]

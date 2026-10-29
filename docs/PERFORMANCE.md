@@ -13,7 +13,7 @@ cd C:\Users\xcx7276\Desktop\proj\parodia
 $env:PARODIA_VSYNC="0"; $env:PARODIA_VALIDATION="0"; cargo run --release
 ```
 Цифры — на экране F3 и в журнале `%APPDATA%\Parodia\logs\latest.log`: раз в 10 секунд строка
-`perf: <FPS> fps, frame <мс> (worst <худший кадр>), cpu <мс>, wait <мс>, gpu <мс>, draws <N>, quads <N>, chunks <нарисовано>/<в поле зрения> (occluded <закрыто>), upload <МБ/с>, <ширина>x<высота>` — средние за 10 секунд.
+`perf: <FPS> fps, frame <мс> (worst <худший кадр>), cpu <мс>, wait <мс>, gpu <мс>, draws <N>, quads <N>, chunks <нарисовано>/<в поле зрения> (occluded <закрыто>), shadows <каскадов за кадр> cascades <квадов в тенях> quads, upload <МБ/с>, <ширина>x<высота>` — средние за 10 секунд.
 `cpu` — работа главного потока без ожидания; `wait` — ожидание видеокарты и монитора.
 
 Для замеров отсечения «до/после» — те же условия, но с флагами `PARODIA_FRUSTUM_CULLING=0`,

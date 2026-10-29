@@ -131,8 +131,20 @@ impl GpuImage {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
+        Self::with_info(device, allocator, &info, vk::ImageViewType::TYPE_2D, aspect, name)
+    }
+
+    /// Картинка по готовому описанию; `view` (типа `view_type`) охватывает все уровни и слои.
+    pub fn with_info(
+        device: &Device,
+        allocator: &SharedAllocator,
+        info: &vk::ImageCreateInfo<'_>,
+        view_type: vk::ImageViewType,
+        aspect: vk::ImageAspectFlags,
+        name: &str,
+    ) -> Result<Self> {
         // SAFETY: valid device and create info.
-        let image = unsafe { device.create_image(&info, None) }?;
+        let image = unsafe { device.create_image(info, None) }?;
         // SAFETY: image was just created.
         let requirements = unsafe { device.get_image_memory_requirements(image) };
         let allocation = allocator
@@ -150,14 +162,14 @@ impl GpuImage {
         unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }?;
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
+            .view_type(view_type)
+            .format(info.format)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: aspect,
                 base_mip_level: 0,
-                level_count: mip_levels,
+                level_count: info.mip_levels,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: info.array_layers,
             });
         // SAFETY: image is bound to memory.
         let view = unsafe { device.create_image_view(&view_info, None) }?;

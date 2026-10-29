@@ -6,13 +6,15 @@
 //! 2. берём свободную картинку из swapchain;
 //! 3. записываем команды:
 //!    - загрузка новых мешей и изменения таблицы чанков;
+//!    - каскады теней, которые пора обновить: отсечение для каскада → отрисовка в его слой карты;
 //!    - ранний проход отсечения (видеокарта выбирает чанки, видимые в прошлом кадре);
 //!    - проход 1: очистка цвета и глубины → ранний список ландшафта;
 //!    - пирамида глубины и поздний проход отсечения (чанки, которые только что открылись);
-//!    - проход 2: поздний список ландшафта → отладочный интерфейс;
+//!    - проход 2: поздний список ландшафта → небо (только где ничего нет) → отладочный интерфейс;
 //! 4. отправляем команды видеокарте и просим показать картинку в окне.
 //!
-//! Подробности отсечения — в `culling.rs`.
+//! Подробности отсечения — в `culling.rs`, теней — в `shadows.rs`, данных кадра для шейдеров
+//! (камера, солнце, туман) — в `frame_data.rs`.
 //!
 //! Тени, небо, вода и прочее будут добавляться в шаг 3 на следующих этапах.
 
@@ -25,11 +27,20 @@ use egui_ash_renderer::allocator::GpuAllocator;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
+use glam::{DVec3, Mat4, Vec3};
+use parodia_core::daytime::Daylight;
+
 use crate::context::{GpuContext, GpuInfo};
 use crate::culling::{CullPass, CullSettings, CullStats, CullView, Culling};
+use crate::frame_data::{FrameData, FrameResources};
 use crate::resources::{GpuImage, SharedAllocator, depth_range};
+use crate::shadows::{
+    CASCADE_SPLITS, CASCADES, SHADOW_DISTANCE, SHADOW_FORMAT, ShadowCamera, ShadowCascades,
+    ShadowGrid, ShadowMap,
+};
+use crate::sky::Sky;
 use crate::swapchain::{Swapchain, color_range, is_srgb};
-use crate::terrain::{ChunkMeshId, ChunkUpload, Terrain, TerrainPush, TerrainStats};
+use crate::terrain::{ChunkMeshId, ChunkUpload, Terrain, TerrainStats};
 use crate::timing::GpuTimer;
 
 /// Сколько кадров может одновременно готовиться (процессор) и рисоваться (видеокарта).
@@ -39,6 +50,14 @@ pub const FRAMES_IN_FLIGHT: usize = 2;
 const CLEAR_COLOR: [f32; 3] = [0.30, 0.50, 0.80];
 /// Формат буфера глубины (32-битное число с плавающей точкой — обязателен для всех видеокарт Vulkan).
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+/// Туман по высоте: плотность у базовой высоты (на блок), убывание с высотой (на блок).
+/// При такой плотности у земли дальние горы в 1–2 км уже заметно в дымке.
+const FOG_DENSITY: f32 = 0.0008;
+const FOG_FALLOFF: f32 = 1.0 / 90.0;
+/// Базовая высота тумана. TEMPORARY: средняя высота рельефа простого генератора (этап 12 — по биому).
+const FOG_BASE_HEIGHT: f32 = 64.0;
+/// Сила затенения углов (AO), 0–1.
+const AO_STRENGTH: f32 = 1.0;
 
 /// Настройки при создании рендера.
 pub struct RendererConfig {
@@ -50,6 +69,17 @@ pub struct RendererConfig {
     pub frustum_culling: bool,
     /// Не рисовать чанки, закрытые другими, — Hi-Z (флаг `PARODIA_OCCLUSION_CULLING`).
     pub occlusion_culling: bool,
+    /// Тени от солнца и луны (флаг `PARODIA_SHADOWS`).
+    pub shadows: bool,
+    /// Сторона карты теней одного каскада в точках (флаг `PARODIA_SHADOW_SIZE`).
+    pub shadow_size: u32,
+    /// Оси карты теней (флаг `PARODIA_SHADOW_GRID`, клавиша G).
+    pub shadow_grid: ShadowGrid,
+    /// Затенение углов (флаг `PARODIA_AO`); сами значения считает мешер.
+    pub ao: bool,
+    /// Угловой размер солнца и луны на небе, градусы (флаги `PARODIA_SUN_SIZE`, `PARODIA_MOON_SIZE`).
+    pub sun_size: f32,
+    pub moon_size: f32,
     pub width: u32,
     pub height: u32,
 }
@@ -63,12 +93,18 @@ pub struct SceneView {
     pub camera_block: [i32; 3],
     /// Дробная часть позиции камеры (0..1 по каждой оси).
     pub camera_frac: [f32; 3],
-    /// Расстояние, на котором туман полностью скрывает мир.
-    pub fog_distance: f32,
-    /// Направление на солнце.
-    pub sun_dir: [f32; 3],
-    /// Цвет неба и тумана (линейный).
-    pub sky_color: [f32; 3],
+    /// Позиция камеры относительно точки отсчёта рендера (для каскадов теней).
+    pub camera_position: [f64; 3],
+    /// Высота камеры в мире (для тумана по высоте).
+    pub camera_height: f64,
+    /// Направление взгляда, угол обзора по вертикали (радианы), соотношение сторон.
+    pub forward: [f32; 3],
+    pub fov_y: f32,
+    pub aspect: f32,
+    /// Дальность обзора: на ней туман полностью скрывает мир.
+    pub view_distance: f32,
+    /// Солнце, луна, цвета неба и света.
+    pub daylight: Daylight,
 }
 
 /// Готовый к отрисовке отладочный интерфейс (результат egui за этот кадр).
@@ -94,6 +130,8 @@ pub struct FrameStats {
     pub gpu_ms: Option<f32>,
     /// Итог отсечения (приходит с задержкой в пару кадров).
     pub cull: CullStats,
+    /// Сколько каскадов теней перерисовано в этом кадре.
+    pub shadow_cascades: u32,
 }
 
 /// Ресурсы одного кадра «в полёте».
@@ -113,6 +151,15 @@ pub struct Renderer {
     ui_format: vk::Format,
     terrain: Option<Terrain>,
     culling: Option<Culling>,
+    sky: Option<Sky>,
+    frame_resources: Option<FrameResources>,
+    shadow_map: Option<ShadowMap>,
+    cascades: ShadowCascades,
+    shadows: bool,
+    ao: bool,
+    /// Угловой радиус солнца и луны (радианы).
+    sun_radius: f32,
+    moon_radius: f32,
     cull_settings: CullSettings,
     last_cull: CullStats,
     /// Буфер глубины можно читать в шейдере (нужно для Hi-Z).
@@ -234,6 +281,26 @@ impl Renderer {
             allocation_sizes: Default::default(),
         })
         .context("failed to create GPU memory allocator")?;
+        let allocator: SharedAllocator = Arc::new(Mutex::new(allocator));
+
+        // Данные кадра и карта теней. Без теней карта крошечная: её только очищают («везде светло»),
+        // чтобы шейдеру всегда было что читать.
+        let frame_resources = FrameResources::new(device, &allocator, FRAMES_IN_FLIGHT)?;
+        let shadow_size = if config.shadows {
+            config.shadow_size.clamp(256, 8192)
+        } else {
+            16
+        };
+        let shadow_map = ShadowMap::new(device, &allocator, shadow_size)?;
+        frame_resources.set_shadow_map(device, shadow_map.view(), shadow_map.sampler());
+        log::info!(
+            "lighting: shadows={} ({}x{} x {CASCADES} cascades, grid {}), ao={}",
+            config.shadows,
+            shadow_size,
+            shadow_size,
+            config.shadow_grid.name(),
+            config.ao
+        );
 
         let timer = if ctx.info.timestamps_supported {
             Some(GpuTimer::new(device, FRAMES_IN_FLIGHT, ctx.info.timestamp_period_ns)?)
@@ -247,11 +314,19 @@ impl Renderer {
             ui_format: vk::Format::UNDEFINED,
             terrain: None,
             culling: None,
+            sky: None,
+            frame_resources: Some(frame_resources),
+            shadow_map: Some(shadow_map),
+            cascades: ShadowCascades::new(shadow_size, config.shadow_grid),
+            shadows: config.shadows,
+            ao: config.ao,
+            sun_radius: (config.sun_size.clamp(0.2, 20.0) * 0.5).to_radians(),
+            moon_radius: (config.moon_size.clamp(0.2, 20.0) * 0.5).to_radians(),
             cull_settings,
             last_cull: CullStats::default(),
             depth_sampled,
             depth: None,
-            allocator: Some(Arc::new(Mutex::new(allocator))),
+            allocator: Some(allocator),
             upload_pool,
             frames,
             frame_index: 0,
@@ -306,6 +381,16 @@ impl Renderer {
     }
 
     /// Задаёт цвета блоков (линейные RGBA по номеру блока). TEMPORARY: до появления текстур.
+    /// Оси карты теней (для сравнения вариантов на ходу); каскады перерисуются в следующем кадре.
+    pub fn set_shadow_grid(&mut self, grid: ShadowGrid) {
+        self.cascades.set_grid(grid);
+        log::info!("lighting: shadow grid {}", grid.name());
+    }
+
+    pub fn shadow_grid(&self) -> ShadowGrid {
+        self.cascades.grid()
+    }
+
     pub fn set_block_colors(&mut self, colors: &[[f32; 4]]) -> Result<()> {
         let terrain = self.terrain.as_mut().context("terrain renderer is not ready")?;
         terrain.set_block_colors(&self.ctx.device, self.ctx.queue, self.upload_pool, colors)
@@ -451,15 +536,88 @@ impl Renderer {
             view_proj: s.view_proj,
             camera_block: s.camera_block,
             camera_frac: s.camera_frac,
+            light_dir: s.daylight.shadow_dir,
         });
-        // Ранний проход отсечения: что было видно в прошлом кадре (или всё в поле зрения без Hi-Z).
-        let mut culled = false;
+
+        // Данные кадра для шейдеров; каскады теней, которые пора перерисовать, ставятся на новое место.
+        let mut shadow_due = [false; CASCADES];
+        let mut cascade_matrices = [Mat4::ZERO; CASCADES];
+        if let Some(scene) = scene {
+            let camera = DVec3::from_array(scene.camera_position);
+            if self.shadows {
+                let light = Vec3::from_array(scene.daylight.shadow_dir);
+                shadow_due = self.cascades.due(recording_frame, light);
+                let shadow_camera = ShadowCamera {
+                    position: camera,
+                    forward: Vec3::from_array(scene.forward),
+                    fov_y: scene.fov_y,
+                    aspect: scene.aspect,
+                };
+                for (index, due) in shadow_due.iter().enumerate() {
+                    if *due {
+                        self.cascades.place(index, &shadow_camera, light);
+                    }
+                }
+            }
+            cascade_matrices = self.cascades.matrices(camera);
+            let sizes = [self.sun_radius, self.moon_radius];
+            let data = frame_data(scene, extent, &self.cascades, &cascade_matrices, self.shadows, self.ao, sizes);
+            if let Some(resources) = self.frame_resources.as_mut() {
+                resources.write(slot, &data)?;
+            }
+        }
+        let frame_set = self.frame_resources.as_ref().map(|r| r.set(slot));
+
         if let Some(culling) = self.culling.as_mut() {
             culling.begin_frame(device, cmd, slot_limit);
-            if let Some(view) = &cull_view {
-                culling.cull(device, cmd, CullPass::Early, view, slot_limit);
-                culled = true;
+        }
+        // Тени: отсечение для каскадов, которые пора обновить, → отрисовка в их слои карты.
+        // Слои, которые ещё ни разу не рисовались, хотя бы очищаются («везде светло»).
+        let mut shadow_cascades = 0;
+        if let (Some(shadow_map), Some(frame_set), Some(view)) =
+            (self.shadow_map.as_mut(), frame_set, &cull_view)
+        {
+            let fresh = shadow_map.fresh_layers();
+            if let Some(culling) = self.culling.as_ref() {
+                for (index, due) in shadow_due.iter().enumerate() {
+                    if *due {
+                        let cascade_view = CullView {
+                            view_proj: cascade_matrices[index].to_cols_array(),
+                            ..*view
+                        };
+                        culling.cull(device, cmd, CullPass::Shadow(index as u32), &cascade_view, slot_limit);
+                    }
+                }
             }
+            for index in 0..CASCADES {
+                if !(shadow_due[index] || fresh[index]) {
+                    continue;
+                }
+                shadow_map.begin(device, cmd, index);
+                if shadow_due[index]
+                    && let (Some(terrain), Some(culling)) = (self.terrain.as_ref(), self.culling.as_ref())
+                {
+                    let list = culling.list(CullPass::Shadow(index as u32));
+                    terrain.record_shadow(
+                        device,
+                        cmd,
+                        shadow_map.size,
+                        index as u32,
+                        frame_set,
+                        &list,
+                        culling.draw_count_supported(),
+                    );
+                    shadow_cascades += 1;
+                }
+                shadow_map.end(device, cmd, index);
+            }
+        }
+
+        // Ранний проход отсечения: что было видно в прошлом кадре (или всё в поле зрения без Hi-Z).
+        let mut culled = false;
+        if let (Some(culling), Some(view)) = (self.culling.as_mut(), &cull_view) {
+            culling.cull(device, cmd, CullPass::Early, view, slot_limit);
+            culled = true;
         }
 
         // Картинка: «неизвестное содержимое» → «в неё рисуем».
@@ -492,7 +650,7 @@ impl Renderer {
             .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
             .image(depth.image)
             .subresource_range(depth_range());
-        let sky = scene.map_or(CLEAR_COLOR, |s| s.sky_color);
+        let sky = scene.map_or(CLEAR_COLOR, |s| s.daylight.sky_horizon);
         let clear = vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [sky[0], sky[1], sky[2], 1.0],
@@ -575,30 +733,6 @@ impl Renderer {
             .image(image)
             .subresource_range(color_range());
 
-        let terrain_push = scene.map(|scene| TerrainPush {
-            view_proj: scene.view_proj,
-            camera_block: [
-                scene.camera_block[0],
-                scene.camera_block[1],
-                scene.camera_block[2],
-                0,
-            ],
-            camera_frac: [
-                scene.camera_frac[0],
-                scene.camera_frac[1],
-                scene.camera_frac[2],
-                scene.fog_distance,
-            ],
-            // В `w` — размер картинки в пикселях: шейдер растягивает грани на полпикселя.
-            sun_dir: [scene.sun_dir[0], scene.sun_dir[1], scene.sun_dir[2], extent.width as f32],
-            fog_color: [
-                scene.sky_color[0],
-                scene.sky_color[1],
-                scene.sky_color[2],
-                extent.height as f32,
-            ],
-        });
-
         // SAFETY: cmd is recording; all referenced objects are alive for this frame.
         unsafe {
             device.cmd_pipeline_barrier2(
@@ -607,11 +741,11 @@ impl Renderer {
             );
             device.cmd_begin_rendering(cmd, &early_rendering);
         }
-        if let (Some(terrain), Some(culling), Some(push), true) =
-            (self.terrain.as_ref(), self.culling.as_ref(), &terrain_push, culled)
+        if let (Some(terrain), Some(culling), Some(frame_set), true) =
+            (self.terrain.as_ref(), self.culling.as_ref(), frame_set, culled)
         {
             let list = culling.list(CullPass::Early);
-            terrain.record(device, cmd, extent, push, &list, culling.draw_count_supported());
+            terrain.record(device, cmd, extent, frame_set, &list, culling.draw_count_supported());
         }
         // SAFETY: cmd is recording inside the rendering scope begun above.
         unsafe { device.cmd_end_rendering(cmd) };
@@ -634,11 +768,15 @@ impl Renderer {
             );
             device.cmd_begin_rendering(cmd, &late_rendering);
         }
-        if let (Some(terrain), Some(culling), Some(push), true) =
-            (self.terrain.as_ref(), self.culling.as_ref(), &terrain_push, late)
+        if let (Some(terrain), Some(culling), Some(frame_set), true) =
+            (self.terrain.as_ref(), self.culling.as_ref(), frame_set, late)
         {
             let list = culling.list(CullPass::Late);
-            terrain.record(device, cmd, extent, push, &list, culling.draw_count_supported());
+            terrain.record(device, cmd, extent, frame_set, &list, culling.draw_count_supported());
+        }
+        // Небо — только там, где ничего не нарисовано.
+        if let (Some(sky), Some(frame_set), Some(_)) = (self.sky.as_ref(), frame_set, scene) {
+            sky.record(device, cmd, extent, frame_set);
         }
         if let (Some(ui_renderer), Some(ui)) = (self.ui.as_mut(), &ui) {
             ui_renderer.cmd_draw(cmd, extent, ui.pixels_per_point, ui.primitives)?;
@@ -712,6 +850,7 @@ impl Renderer {
             upload_bytes,
             gpu_ms: self.last_gpu_ms,
             cull: self.last_cull,
+            shadow_cascades,
         }))
     }
 
@@ -762,6 +901,11 @@ impl Renderer {
         self.depth = Some(depth);
 
         let format_changed = self.ui_format != format;
+        let frame_layout = self
+            .frame_resources
+            .as_ref()
+            .map(FrameResources::set_layout)
+            .context("frame resources are missing")?;
         match self.terrain.as_mut() {
             None => {
                 self.terrain = Some(Terrain::new(
@@ -771,10 +915,21 @@ impl Renderer {
                     DEPTH_FORMAT,
                     self.face_culling,
                     FRAMES_IN_FLIGHT,
+                    frame_layout,
+                    SHADOW_FORMAT,
                 )?);
             }
             Some(terrain) if format_changed => {
                 terrain.recreate_pipeline(&self.ctx.device, format, DEPTH_FORMAT)?;
+            }
+            Some(_) => {}
+        }
+        match self.sky.as_mut() {
+            None => {
+                self.sky = Some(Sky::new(&self.ctx.device, frame_layout, format, DEPTH_FORMAT)?);
+            }
+            Some(sky) if format_changed => {
+                sky.recreate_pipeline(&self.ctx.device, format, DEPTH_FORMAT)?;
             }
             Some(_) => {}
         }
@@ -841,8 +996,17 @@ impl Drop for Renderer {
             if let Some(mut culling) = self.culling.take() {
                 culling.destroy(device, &allocator);
             }
+            if let Some(mut sky) = self.sky.take() {
+                sky.destroy(device);
+            }
+            if let Some(mut shadow_map) = self.shadow_map.take() {
+                shadow_map.destroy(device, &allocator);
+            }
             if let Some(mut terrain) = self.terrain.take() {
                 terrain.destroy(device, &allocator);
+            }
+            if let Some(mut resources) = self.frame_resources.take() {
+                resources.destroy(device, &allocator);
             }
             if let Some(mut depth) = self.depth.take() {
                 depth.destroy(device, &allocator);
@@ -866,5 +1030,43 @@ impl Drop for Renderer {
         // Распределитель памяти освобождается до устройства.
         self.allocator = None;
         log::info!("renderer destroyed");
+    }
+}
+
+/// Собирает данные кадра для шейдеров.
+fn frame_data(
+    scene: &SceneView,
+    extent: vk::Extent2D,
+    cascades: &ShadowCascades,
+    matrices: &[Mat4; CASCADES],
+    shadows: bool,
+    ao: bool,
+    body_radius: [f32; 2],
+) -> FrameData {
+    let light = &scene.daylight;
+    let v4 = |v: [f32; 3], w: f32| [v[0], v[1], v[2], w];
+    let inverse = Mat4::from_cols_array(&scene.view_proj).inverse();
+    // Тени нужны, только когда есть прямой свет.
+    let light_on = light.light_color.iter().any(|c| *c > 1.0e-3);
+    let texel = cascades.texel_sizes();
+    FrameData {
+        view_proj: scene.view_proj,
+        inv_view_proj: inverse.to_cols_array(),
+        cascades: std::array::from_fn(|i| matrices[i].to_cols_array()),
+        cascade_split: CASCADE_SPLITS,
+        cascade_texel: texel,
+        camera_block: [scene.camera_block[0], scene.camera_block[1], scene.camera_block[2], 0],
+        camera_frac: v4(scene.camera_frac, scene.view_distance),
+        light_dir: v4(light.light_dir, if shadows && light_on { 1.0 } else { 0.0 }),
+        light_color: v4(light.light_color, SHADOW_DISTANCE),
+        ambient_sky: v4(light.ambient_sky, if ao { AO_STRENGTH } else { 0.0 }),
+        ambient_ground: v4(light.ambient_ground, 0.0),
+        sky_zenith: v4(light.sky_zenith, 0.0),
+        sky_horizon: v4(light.sky_horizon, 0.0),
+        sun_dir: v4(light.sun_dir, light.day),
+        moon_dir: v4(light.moon_dir, body_radius[1]),
+        sun_glow: v4(light.sun_glow, body_radius[0]),
+        fog: [FOG_DENSITY, FOG_FALLOFF, scene.camera_height as f32, FOG_BASE_HEIGHT],
+        viewport: [extent.width as f32, extent.height as f32, 0.0, 0.0],
     }
 }

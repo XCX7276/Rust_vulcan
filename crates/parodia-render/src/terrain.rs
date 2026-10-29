@@ -50,17 +50,14 @@ const SLOT_BYTES: u64 = 32;
 
 const TERRAIN_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terrain.vert.spv"));
 const TERRAIN_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terrain.frag.spv"));
+const TERRAIN_SHADOW_VERT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/terrain_shadow.vert.spv"));
 
-/// Данные, которые каждый кадр передаются шейдерам ландшафта (ровно 128 байт — максимум,
-/// который Vulkan гарантирует для push constants).
+/// Номер каскада теней для шейдера `terrain_shadow.vert` (push constant).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-pub struct TerrainPush {
-    pub view_proj: [f32; 16],
-    pub camera_block: [i32; 4],
-    pub camera_frac: [f32; 4],
-    pub sun_dir: [f32; 4],
-    pub fog_color: [f32; 4],
+struct ShadowPush {
+    cascade: u32,
 }
 
 /// Номер чанка в рендере (= его слот в таблице чанков).
@@ -132,10 +129,13 @@ pub struct Terrain {
     descriptor_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// Отрисовка в карту теней (только глубина).
+    shadow_pipeline: vk::Pipeline,
     face_culling: bool,
 }
 
 impl Terrain {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
         allocator: &SharedAllocator,
@@ -143,6 +143,8 @@ impl Terrain {
         depth_format: vk::Format,
         face_culling: bool,
         frames_in_flight: usize,
+        frame_layout: vk::DescriptorSetLayout,
+        shadow_format: vk::Format,
     ) -> Result<Self> {
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let pool = GpuBuffer::new(
@@ -236,21 +238,24 @@ impl Terrain {
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
         let push_range = [vk::PushConstantRange {
-            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            stage_flags: vk::ShaderStageFlags::VERTEX,
             offset: 0,
-            size: size_of::<TerrainPush>() as u32,
+            size: size_of::<ShadowPush>() as u32,
         }];
-        // SAFETY: valid device and set layout.
+        // set 0 — геометрия (этот файл), set 1 — данные кадра и карта теней (`frame_data.rs`).
+        let pipeline_layouts = [set_layout, frame_layout];
+        // SAFETY: valid device and set layouts.
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&layouts)
+                    .set_layouts(&pipeline_layouts)
                     .push_constant_ranges(&push_range),
                 None,
             )
         }?;
         let pipeline =
             create_pipeline(device, pipeline_layout, color_format, depth_format, face_culling)?;
+        let shadow_pipeline = create_shadow_pipeline(device, pipeline_layout, shadow_format)?;
 
         Ok(Self {
             pool,
@@ -273,6 +278,7 @@ impl Terrain {
             descriptor_set,
             pipeline_layout,
             pipeline,
+            shadow_pipeline,
             face_culling,
         })
     }
@@ -537,7 +543,42 @@ impl Terrain {
         device: &Device,
         cmd: vk::CommandBuffer,
         extent: vk::Extent2D,
-        push: &TerrainPush,
+        frame_set: vk::DescriptorSet,
+        list: &IndirectList,
+        draw_count: bool,
+    ) {
+        self.draw(device, cmd, self.pipeline, extent, frame_set, None, list, draw_count);
+    }
+
+    /// Записывает отрисовку в каскад теней `cascade` (внутри прохода отрисовки в его слой).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_shadow(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        size: u32,
+        cascade: u32,
+        frame_set: vk::DescriptorSet,
+        list: &IndirectList,
+        draw_count: bool,
+    ) {
+        let extent = vk::Extent2D {
+            width: size,
+            height: size,
+        };
+        let push = ShadowPush { cascade };
+        self.draw(device, cmd, self.shadow_pipeline, extent, frame_set, Some(push), list, draw_count);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        pipeline: vk::Pipeline,
+        extent: vk::Extent2D,
+        frame_set: vk::DescriptorSet,
+        push: Option<ShadowPush>,
         list: &IndirectList,
         draw_count: bool,
     ) {
@@ -560,22 +601,24 @@ impl Terrain {
         // SAFETY: cmd is recording inside a rendering scope with matching formats; the culling
         // barrier made the command list readable for indirect drawing.
         unsafe {
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
                 0,
-                &[self.descriptor_set],
+                &[self.descriptor_set, frame_set],
                 &[],
             );
-            device.cmd_push_constants(
-                cmd,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                bytemuck::bytes_of(push),
-            );
+            if let Some(push) = push {
+                device.cmd_push_constants(
+                    cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::bytes_of(&push),
+                );
+            }
             device.cmd_set_viewport(cmd, 0, &[viewport]);
             device.cmd_set_scissor(cmd, 0, &[scissor]);
             if draw_count {
@@ -609,6 +652,7 @@ impl Terrain {
         // SAFETY: caller waited for the device to be idle.
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline(self.shadow_pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.set_layout, None);
@@ -725,5 +769,61 @@ fn create_pipeline(
         device.destroy_shader_module(frag, None);
     }
     let pipelines = result.map_err(|(_, error)| error).context("terrain pipeline creation failed")?;
+    Ok(pipelines[0])
+}
+
+/// Конвейер отрисовки в карту теней: только вершинный шейдер и глубина.
+fn create_shadow_pipeline(
+    device: &Device,
+    layout: vk::PipelineLayout,
+    depth_format: vk::Format,
+) -> Result<vk::Pipeline> {
+    let vert = create_shader(device, TERRAIN_SHADOW_VERT)?;
+    let stages = [vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::VERTEX)
+        .module(vert)
+        .name(c"main")];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    // Стороны выбирает отсечение целыми группами (повёрнутые от света); здесь отсечения нет.
+    // Сдвига глубины нет: в карте только стороны, повёрнутые от света, и освещённая грань не
+    // может затенить сама себя, а сдвиг давал светлую щель у основания стен.
+    let raster = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+    let blend = vk::PipelineColorBlendStateCreateInfo::default();
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let mut rendering = vk::PipelineRenderingCreateInfo::default().depth_attachment_format(depth_format);
+    let info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth)
+        .color_blend_state(&blend)
+        .dynamic_state(&dynamic)
+        .layout(layout)
+        .push_next(&mut rendering);
+    // SAFETY: all referenced state lives until the call returns.
+    let result = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) };
+    // SAFETY: the module is no longer needed once the pipeline is created (or creation failed).
+    unsafe { device.destroy_shader_module(vert, None) };
+    let pipelines = result
+        .map_err(|(_, error)| error)
+        .context("terrain shadow pipeline creation failed")?;
     Ok(pipelines[0])
 }
